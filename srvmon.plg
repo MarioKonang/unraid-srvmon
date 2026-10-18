@@ -1,0 +1,1464 @@
+<?xml version="1.0" standalone="yes"?>
+<!DOCTYPE PLUGIN [
+<!ENTITY name      "srvmon">
+<!ENTITY author    "local">
+<!ENTITY version   "2026.10.18i">
+<!ENTITY pluginURL "https://example.invalid/srvmon.plg">
+<!ENTITY emhttp    "/usr/local/emhttp/plugins/&name;">
+<!ENTITY plgpath   "/boot/config/plugins/&name;">
+]>
+<PLUGIN name="&name;" author="&author;" version="&version;" pluginURL="&pluginURL;" min="6.12.0" icon="heartbeat" launch="Settings/srvmon">
+
+<CHANGES>
+###2026.10.18i
+- Webhook-Versand (z. B. an Home Assistant fuer Alexa-Ansagen), Mindest-Level einstellbar, max. 3 Aufrufe pro Lauf
+- Heartbeat-URL fuer externe Ausfallueberwachung (healthchecks.io, Uptime Kuma)
+
+###2026.10.18h
+- Einstellungsseite in Abschnitte gegliedert (Allgemein, Disks, Speicherplatz, Docker, VMs, System, Zertifikate)
+
+###2026.10.18g
+- Zertifikatsdateien, die durch ein neueres Zertifikat fuer dieselben Domains ersetzt wurden, werden ignoriert
+- Hinweis auf die Schreibweise host@LAN-IP:Port, wenn die Live-Pruefung keine Verbindung bekommt
+
+###2026.10.18f
+- Leere Disk-Slots ohne Geraet und ID werden ignoriert (Fehlalarm bei leerem Parity2-Slot mit DISK_NP_DSBL)
+
+###2026.10.18e
+- Cron-Eintrag wird nach Abschluss der Installation erneut eingelesen (vorher fehlte er nach der Installation)
+- Icon, Beschreibung und Link zur Einstellungsseite in der Pluginliste
+
+###2026.10.18d
+- TLS-Zertifikate: Ablauf der Zertifikatsdateien (Nginx Proxy Manager) und der live ausgelieferten Zertifikate
+- Erkennung, wenn nginx nach einer Erneuerung noch das alte Zertifikat ausliefert
+- Pruefung von Vertrauenskette und Hostname, Statusseite mit Zertifikatsuebersicht
+
+###2026.10.18c
+- Meldung, wenn ein Container mit einem neuen Image gestartet wurde (inkl. Version aus den Image-Labels)
+- Meldung zu verfügbaren Updates nennt die betroffenen Container
+- Statusseite: Update-Hinweis, Version und Zeitpunkt des letzten Updates pro Container
+- Neue Option CHECK_DOCKER_UPDATED
+
+###2026.10.18b
+- Neue Seite "Server Monitor Status" mit Live-Ansicht (Aktualisierung alle 30 s)
+- Datensammlung in include/lib.php ausgelagert, JSON-Endpunkt include/data.php
+
+###2026.10.18a
+- CSRF-Token im Einstellungsformular explizit gesetzt
+
+###2026.10.18
+- Erste Version: Disks, SMART, Speicher, Docker, VMs, System, USV, Docker-Updates
+</CHANGES>
+
+<FILE Name="&emhttp;/README.md">
+<INLINE><![CDATA[**Server Monitor (srvmon)**
+
+Überwacht Disks, SMART, Speicherplatz, Docker-Container und -Updates, VMs, System, USV und TLS-Zertifikate und meldet Probleme über Unraids Benachrichtigungen. Einstellungen und Live-Status unter Settings > User Utilities.
+]]></INLINE>
+</FILE>
+
+<FILE Name="&emhttp;/default.cfg">
+<INLINE><![CDATA[INTERVAL="5"
+CHECK_DISKS="yes"
+CHECK_SMART="yes"
+CHECK_SPACE="yes"
+CHECK_DOCKER="yes"
+CHECK_VMS="yes"
+CHECK_SYSTEM="yes"
+CHECK_UPS="yes"
+CHECK_UPDATES="yes"
+CHECK_DOCKER_UPDATED="yes"
+TEMP_HDD_WARN="45"
+TEMP_HDD_CRIT="50"
+TEMP_NVME_WARN="60"
+TEMP_NVME_CRIT="70"
+SPACE_PATHS="/mnt/user,/mnt/cache,/var/log,/var/lib/docker"
+SPACE_WARN="85"
+SPACE_CRIT="95"
+DOCKER_WATCH="*"
+VM_WATCH=""
+CPU_LOAD_WARN="90"
+RAM_WARN="90"
+REMIND_HOURS="24"
+NOTIFY_RESOLVED="yes"
+CHECK_CERTS="yes"
+CERT_DIRS="/mnt/user/appdata/NginxProxyManager/letsencrypt/live"
+CERT_HOSTS=""
+CERT_WARN_DAYS="20"
+CERT_CRIT_DAYS="7"
+CERT_VERIFY="yes"
+CERT_IGNORE=""
+WEBHOOK_URL=""
+WEBHOOK_LEVEL="warning"
+HEARTBEAT_URL=""
+]]></INLINE>
+</FILE>
+
+<FILE Name="&emhttp;/include/lib.php">
+<INLINE><![CDATA[<?php
+/*
+ * srvmon - gemeinsame Funktionen für check.php (Prüfung) und data.php (Statusseite)
+ */
+declare(strict_types=1);
+
+const SM_DEF_CFG     = '/usr/local/emhttp/plugins/srvmon/default.cfg';
+const SM_USR_CFG     = '/boot/config/plugins/srvmon/srvmon.cfg';
+const SM_STATE       = '/boot/config/plugins/srvmon/state.json';   // Flash: nur bei Änderung schreiben
+const SM_TMP         = '/tmp/srvmon';                              // RAM
+const SM_NOTIFY      = '/usr/local/emhttp/webGui/scripts/notify';
+const SM_DISKS_INI   = '/var/local/emhttp/disks.ini';
+const SM_DOCKER_UPD  = '/var/lib/docker/unraid-update-status.json';
+
+// Überwachte ATA-Zähler: id => [Bezeichnung, Level bei Anstieg]
+const SM_ATA_WATCH = [
+    5   => ['Reallocated_Sector_Ct',  'alert'],
+    187 => ['Reported_Uncorrect',     'alert'],
+    197 => ['Current_Pending_Sector', 'alert'],
+    198 => ['Offline_Uncorrectable',  'alert'],
+    199 => ['UDMA_CRC_Error_Count',   'warning'],   // meist Kabel/Backplane
+];
+
+// ------------------------------------------------------------ Konfiguration
+
+function sm_load_cfg(): array
+{
+    $def = @parse_ini_file(SM_DEF_CFG) ?: [];
+    $usr = is_file(SM_USR_CFG) ? (@parse_ini_file(SM_USR_CFG) ?: []) : [];
+    return array_merge($def, $usr);
+}
+
+function sm_load_state(): array
+{
+    $j = json_decode((string)@file_get_contents(SM_STATE), true);
+    return is_array($j) ? $j : [];
+}
+
+function sm_save_state(array $state): void
+{
+    $json = json_encode($state, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    if ($json === false || @file_get_contents(SM_STATE) === $json) return;   // Flash schonen
+    @mkdir(dirname(SM_STATE), 0755, true);
+    if (@file_put_contents(SM_STATE . '.tmp', $json) !== false) @rename(SM_STATE . '.tmp', SM_STATE);
+}
+
+// parse_ini_file wandelt yes/no in "1"/"" um, daher tolerant auswerten
+function sm_on(array $c, string $k): bool
+{
+    return in_array(strtolower(trim((string)($c[$k] ?? ''))), ['1', 'yes', 'true', 'on'], true);
+}
+
+function sm_num(array $c, string $k, float $def): float
+{
+    $v = $c[$k] ?? '';
+    return is_numeric($v) ? (float)$v : $def;
+}
+
+function sm_list($v): array
+{
+    return array_values(array_filter(array_map('trim', explode(',', (string)$v)), 'strlen'));
+}
+
+function sm_bytes(float $b): string
+{
+    $u = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+    $i = 0;
+    while ($b >= 1024 && $i < count($u) - 1) { $b /= 1024; $i++; }
+    return sprintf('%.1f %s', $b, $u[$i]);
+}
+
+// ------------------------------------------------------------ Datensammler
+// Jeder Sammler liefert null, wenn die Quelle nicht verfügbar ist.
+
+function sm_get_disks(): ?array
+{
+    $ini = @parse_ini_file(SM_DISKS_INI, true);
+    if (!is_array($ini)) return null;
+    $r = [];
+    foreach ($ini as $sec => $d) {
+        if (!is_array($d)) continue;
+        $status = (string)($d['status'] ?? '');
+        $dev    = (string)($d['device'] ?? '');
+        if ($status === '' || $status === 'DISK_NP') continue;   // leerer Slot
+        // Unbelegter Slot ohne Gerät und ohne ID (z. B. leerer Parity2-Slot mit DISK_NP_DSBL).
+        // Eine zugewiesene, aber fehlende Disk behält ihre ID und wird weiterhin gemeldet.
+        if ($dev === '' && trim((string)($d['id'] ?? '')) === '') continue;
+        $temp = $d['temp'] ?? '';
+        $r[] = [
+            'name'   => (string)($d['name'] ?? $sec),
+            'device' => $dev,
+            'id'     => (string)($d['id'] ?? $dev),
+            'status' => $status,
+            'type'   => (string)($d['type'] ?? ''),
+            'temp'   => is_numeric($temp) ? (float)$temp : null,   // null = Spindown / unbekannt
+            'errors' => (int)($d['numErrors'] ?? 0),
+            'nvme'   => strncmp($dev, 'nvme', 4) === 0,
+        ];
+    }
+    return $r;
+}
+
+/** SMART lesen ohne schlafende Disks zu wecken. null = Standby oder nicht lesbar. */
+function sm_get_smart(string $dev): ?array
+{
+    $out = []; $rc = 0;
+    exec('timeout 60 smartctl -n standby -j -H -A ' . escapeshellarg("/dev/$dev") . ' 2>/dev/null', $out, $rc);
+    $j = json_decode(implode("\n", $out), true);
+    if (!is_array($j) || !isset($j['smart_status']['passed'])) return null;
+
+    $res = ['passed' => $j['smart_status']['passed'] === true, 'counters' => [], 'nvme_cw' => null, 'wear' => null];
+    foreach ($j['ata_smart_attributes']['table'] ?? [] as $a) {
+        $aid = (int)($a['id'] ?? 0);
+        if (isset(SM_ATA_WATCH[$aid])) {
+            $res['counters'][SM_ATA_WATCH[$aid][0]] = [(int)($a['raw']['value'] ?? 0), SM_ATA_WATCH[$aid][1]];
+        }
+    }
+    $nv = $j['nvme_smart_health_information_log'] ?? null;
+    if (is_array($nv)) {
+        $res['counters']['Media_Errors'] = [(int)($nv['media_errors'] ?? 0), 'alert'];
+        $res['nvme_cw'] = (int)($nv['critical_warning'] ?? 0);
+        $res['wear']    = (int)($nv['percentage_used'] ?? 0);
+    }
+    return $res;
+}
+
+function sm_mounted(string $p): bool
+{
+    $o = []; $rc = 0;
+    exec('mountpoint -q ' . escapeshellarg($p) . ' 2>/dev/null', $o, $rc);
+    return $rc === 0;
+}
+
+function sm_get_space(array $paths): array
+{
+    $r = [];
+    foreach ($paths as $p) {
+        if (!sm_mounted($p)) continue;          // nicht gemountet (z. B. Array gestoppt)
+        $t = @disk_total_space($p);
+        $f = @disk_free_space($p);
+        if (!$t || $f === false) continue;
+        $r[] = ['path' => $p, 'total' => $t, 'free' => $f, 'pct' => round(100.0 * (1 - $f / $t), 1)];
+    }
+    return $r;
+}
+
+function sm_get_docker(): ?array
+{
+    $out = []; $rc = 0;
+    exec("timeout 30 docker ps -a --format '{{.Names}}\t{{.State}}\t{{.Status}}' 2>/dev/null", $out, $rc);
+    if ($rc !== 0) return null;                 // Docker-Dienst aus oder nicht erreichbar
+    $r = [];
+    foreach ($out as $line) {
+        $f = explode("\t", $line);
+        if (count($f) < 3) continue;
+        $r[] = ['name' => $f[0], 'state' => $f[1], 'status' => $f[2],
+                'unhealthy' => stripos($f[2], '(unhealthy)') !== false];
+    }
+    usort($r, fn($a, $b) => strcasecmp($a['name'], $b['name']));
+    return $r;
+}
+
+function sm_get_vms(): ?array
+{
+    $out = []; $rc = 0;
+    exec('timeout 30 virsh list --all --name 2>/dev/null', $out, $rc);
+    if ($rc !== 0) return null;                 // VM-Dienst aus
+    $r = [];
+    foreach (array_filter(array_map('trim', $out), 'strlen') as $vm) {
+        $st  = trim((string)shell_exec('timeout 10 virsh domstate ' . escapeshellarg($vm) . ' 2>/dev/null'));
+        $r[] = ['name' => $vm, 'state' => $st];
+    }
+    usort($r, fn($a, $b) => strcasecmp($a['name'], $b['name']));
+    return $r;
+}
+
+function sm_get_system(): array
+{
+    $la    = explode(' ', (string)@file_get_contents('/proc/loadavg'));
+    $cores = max(1, (int)trim((string)shell_exec('nproc 2>/dev/null')));
+    $mi    = [];
+    foreach (@file('/proc/meminfo') ?: [] as $l) {
+        if (preg_match('/^(\w+):\s+(\d+)/', $l, $m)) $mi[$m[1]] = (int)$m[2] * 1024;
+    }
+    $total = $mi['MemTotal'] ?? 0;
+    $avail = $mi['MemAvailable'] ?? null;
+    $load5 = isset($la[1]) && is_numeric($la[1]) ? (float)$la[1] : null;
+    return [
+        'load'      => [isset($la[0]) && is_numeric($la[0]) ? (float)$la[0] : null, $load5,
+                        isset($la[2]) && is_numeric($la[2]) ? (float)$la[2] : null],
+        'cores'     => $cores,
+        'load_pct'  => $load5 === null ? null : round($load5 / $cores * 100, 1),
+        'mem_total' => $total,
+        'mem_avail' => $avail,
+        'mem_pct'   => ($total > 0 && $avail !== null) ? round(100.0 * (1 - $avail / $total), 1) : null,
+        'uptime'    => (int)(float)explode(' ', (string)@file_get_contents('/proc/uptime'))[0],
+        'boot_id'   => trim((string)@file_get_contents('/proc/sys/kernel/random/boot_id')),
+    ];
+}
+
+function sm_get_ups(): ?array
+{
+    $out = []; $rc = 0;
+    exec('timeout 10 apcaccess status 2>/dev/null', $out, $rc);
+    if ($rc !== 0 || !$out) return null;        // kein apcupsd aktiv
+    $u = [];
+    foreach ($out as $l) {
+        $p = strpos($l, ':');
+        if ($p !== false) $u[trim(substr($l, 0, $p))] = trim(substr($l, $p + 1));
+    }
+    return ['status' => $u['STATUS'] ?? '', 'charge' => $u['BCHARGE'] ?? '',
+            'timeleft' => $u['TIMELEFT'] ?? '', 'load' => $u['LOADPCT'] ?? '', 'model' => $u['MODEL'] ?? ''];
+}
+
+/**
+ * Image-Informationen pro Container: Image-ID, Image-Referenz und Version aus den Labels.
+ * Grundlage für die Erkennung durchgeführter Updates (neue Image-ID bei gleichem Container).
+ */
+function sm_get_docker_images(): ?array
+{
+    $ids = []; $rc = 0;
+    exec('timeout 30 docker ps -aq 2>/dev/null', $ids, $rc);
+    if ($rc !== 0) return null;
+    $ids = array_filter(array_map('trim', $ids), 'strlen');
+    if (!$ids) return [];
+    $out = [];
+    $fmt = '{{.Name}}\t{{.Image}}\t{{.Config.Image}}\t{{json .Config.Labels}}';
+    exec('timeout 60 docker inspect --format ' . escapeshellarg($fmt) . ' '
+         . implode(' ', array_map('escapeshellarg', $ids)) . ' 2>/dev/null', $out, $rc);
+    if ($rc !== 0) return null;              // z. B. Container zwischenzeitlich entfernt: nächster Lauf
+    $r = [];
+    foreach ($out as $line) {
+        $f = explode("\t", $line, 4);
+        if (count($f) < 4) continue;
+        $labels  = json_decode($f[3], true);
+        $labels  = is_array($labels) ? $labels : [];
+        $version = (string)($labels['org.opencontainers.image.version'] ?? $labels['version'] ?? $labels['build_version'] ?? '');
+        $r[ltrim($f[0], '/')] = ['id' => $f[1], 'image' => $f[2], 'version' => preg_match('/^.{0,80}/us', trim($version), $m) ? $m[0] : ''];
+    }
+    return $r;
+}
+
+/** Image-Referenz vergleichbar machen: fehlender Tag wird zu :latest. */
+function sm_norm_image(string $ref): string
+{
+    $ref  = trim($ref);
+    if ($ref === '' || strpos($ref, '@') !== false) return $ref;
+    $last = substr($ref, (int)strrpos('/' . $ref, '/'));
+    return strpos($last, ':') === false ? "$ref:latest" : $ref;
+}
+
+/** Liest Unraids eigene Docker-Update-Prüfung; srvmon fragt keine Registry selbst ab. */
+function sm_get_updates(): ?array
+{
+    $raw = @file_get_contents(SM_DOCKER_UPD);
+    if ($raw === false) return null;
+    $j = json_decode($raw, true);
+    if (!is_array($j)) return null;
+    $avail = [];
+    foreach ($j as $image => $e) {
+        if (!is_array($e)) continue;
+        $l = (string)($e['local'] ?? '');
+        $r = (string)($e['remote'] ?? '');
+        if ($l !== '' && $r !== '' && $l !== 'undef' && $r !== 'undef' && $l !== $r) $avail[] = (string)$image;
+    }
+    sort($avail);
+    return $avail;
+}
+
+// ------------------------------------------------------------ TLS-Zertifikate
+
+/** Ausgabe von "openssl x509 -noout -enddate -subject -issuer -ext subjectAltName" auswerten. */
+function sm_parse_x509(array $out): ?array
+{
+    $end = null; $subj = ''; $iss = ''; $names = [];
+    foreach ($out as $l) {
+        $l = trim($l);
+        if (strncmp($l, 'notAfter=', 9) === 0)    $end  = strtotime(substr($l, 9)) ?: null;
+        elseif (strncmp($l, 'subject=', 8) === 0) $subj = substr($l, 8);
+        elseif (strncmp($l, 'issuer=', 7) === 0)  $iss  = substr($l, 7);
+        if (preg_match_all('/DNS:([^,\s]+)/', $l, $m)) $names = array_merge($names, $m[1]);
+    }
+    if ($end === null) return null;
+    $cn  = preg_match('/CN\s*=\s*([^,\/]+)/', $subj, $m) ? trim($m[1]) : '';
+    $isn = preg_match('/CN\s*=\s*([^,\/]+)/', $iss, $m) ? trim($m[1])
+         : (preg_match('/O\s*=\s*([^,\/]+)/', $iss, $m) ? trim($m[1]) : '');
+    $names = array_values(array_unique($names ?: ($cn !== '' ? [$cn] : [])));
+    return ['expires' => $end, 'names' => $names, 'issuer' => $isn];
+}
+
+function sm_cert_from_file(string $file): ?array
+{
+    $out = []; $rc = 0;
+    exec('timeout 15 openssl x509 -noout -enddate -subject -issuer -ext subjectAltName -in '
+         . escapeshellarg($file) . ' 2>/dev/null', $out, $rc);
+    return $rc === 0 ? sm_parse_x509($out) : null;
+}
+
+/** Sucht in jedem Verzeichnis nach <dir>/*\/fullchain.pem (Let's-Encrypt-Struktur "live"). */
+function sm_get_cert_files(array $dirs): array
+{
+    $res = ['missing' => [], 'certs' => []];
+    foreach ($dirs as $dir) {
+        $dir = rtrim($dir, '/');
+        if (!is_dir($dir)) { $res['missing'][] = $dir; continue; }
+        $files = glob("$dir/*/fullchain.pem") ?: [];
+        if (is_file("$dir/fullchain.pem")) $files[] = "$dir/fullchain.pem";
+        foreach ($files as $f) {
+            $id = basename(dirname($f));
+            $c  = sm_cert_from_file($f);
+            $res['certs'][] = $c === null
+                ? ['id' => $id, 'path' => $f, 'error' => 'Zertifikat nicht lesbar']
+                : $c + ['id' => $id, 'path' => $f];
+        }
+    }
+    return $res;
+}
+
+/**
+ * Eintrag zerlegen. Erlaubt sind "host", "host:port", "host@adresse", "host@adresse:port"
+ * und "host:port@adresse". Ohne Adresse wird der Hostname angesprochen, ohne Port 443.
+ */
+function sm_parse_cert_host(string $e): array
+{
+    [$hp, $addr] = array_pad(explode('@', trim($e), 2), 2, '');
+    $host = $hp; $port = 443;
+    if (preg_match('/^(.+):(\d+)$/', $hp, $m)) { $host = $m[1]; $port = (int)$m[2]; }
+    if (preg_match('/^(.+):(\d+)$/', $addr, $m)) { $addr = $m[1]; $port = (int)$m[2]; }
+    return ['host' => $host, 'port' => $port, 'addr' => $addr !== '' ? $addr : $host];
+}
+
+/** Ausgeliefertes Zertifikat per TLS-Handshake (mit SNI) abholen und prüfen. */
+function sm_get_cert_live(string $entry): array
+{
+    $t   = sm_parse_cert_host($entry);
+    $res = $t + ['error' => null, 'verify' => null];
+    $out = []; $rc = 0;
+    exec('timeout 15 openssl s_client -connect ' . escapeshellarg($t['addr'] . ':' . $t['port'])
+         . ' -servername ' . escapeshellarg($t['host'])
+         . ' -verify_hostname ' . escapeshellarg($t['host'])
+         . ' </dev/null 2>/dev/null', $out, $rc);
+    $txt = implode("\n", $out);
+    if (!preg_match('/-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----/s', $txt, $m)) {
+        $res['error'] = 'Keine TLS-Verbindung zu ' . $t['addr'] . ':' . $t['port'];
+        return $res;
+    }
+    if (preg_match('/Verify return code: (\d+) \(([^)]*)\)/', $txt, $v)) {
+        $res['verify'] = ['code' => (int)$v[1], 'text' => $v[2]];
+    }
+    @mkdir(SM_TMP, 0755, true);
+    $tmp = tempnam(SM_TMP, 'cert');
+    file_put_contents($tmp, $m[0]);
+    $c = sm_cert_from_file($tmp);
+    @unlink($tmp);
+    if ($c === null) { $res['error'] = 'Zertifikat nicht auswertbar'; return $res; }
+    return $res + $c;
+}
+
+/** Deckt das Zertifikat den Hostnamen ab? Wildcards gelten für genau eine Ebene. */
+function sm_cert_covers(array $names, string $host): bool
+{
+    $host = strtolower($host);
+    foreach ($names as $n) {
+        $n = strtolower($n);
+        if ($n === $host) return true;
+        if (strncmp($n, '*.', 2) === 0) {
+            $dot = strpos($host, '.');
+            if ($dot !== false && substr($host, $dot + 1) === substr($n, 2)) return true;
+        }
+    }
+    return false;
+}
+]]></INLINE>
+</FILE>
+
+<FILE Name="&emhttp;/include/data.php">
+<INLINE><![CDATA[<?php
+/*
+ * srvmon - JSON-Endpunkt für die Statusseite.
+ * Liegt unter /plugins/srvmon/include/ und ist damit durch den WebGUI-Login geschützt.
+ * SMART wird hier NICHT live gelesen (würde dauern), sondern der letzte Stand aus check.php angezeigt.
+ */
+declare(strict_types=1);
+require_once '/usr/local/emhttp/plugins/srvmon/include/lib.php';
+
+header('Content-Type: application/json; charset=utf-8');
+header('Cache-Control: no-store');
+
+$cfg    = sm_load_cfg();
+$state  = sm_load_state();
+$status = json_decode((string)@file_get_contents(SM_TMP . '/status.json'), true) ?: [];
+
+$issues = [];
+foreach ($state['issues'] ?? [] as $k => $i) {
+    $issues[] = ['key' => (string)$k, 'level' => $i['level'] ?? 'warning', 'subject' => $i['subject'] ?? '',
+                 'desc' => $i['desc'] ?? '', 'since' => (int)($i['since'] ?? 0)];
+}
+usort($issues, fn($a, $b) => (['alert' => 0, 'warning' => 1][$a['level']] ?? 2)
+                            <=> (['alert' => 0, 'warning' => 1][$b['level']] ?? 2));
+
+$out = [
+    'time'    => time(),
+    'lastrun' => isset($status['lastrun']) ? (int)$status['lastrun'] : null,
+    'issues'  => $issues,
+    'thresholds' => [
+        'hdd'   => [sm_num($cfg, 'TEMP_HDD_WARN', 45),  sm_num($cfg, 'TEMP_HDD_CRIT', 50)],
+        'nvme'  => [sm_num($cfg, 'TEMP_NVME_WARN', 60), sm_num($cfg, 'TEMP_NVME_CRIT', 70)],
+        'space' => [sm_num($cfg, 'SPACE_WARN', 85),     sm_num($cfg, 'SPACE_CRIT', 95)],
+        'cpu'   => sm_num($cfg, 'CPU_LOAD_WARN', 90),
+        'ram'   => sm_num($cfg, 'RAM_WARN', 90),
+    ],
+];
+
+if (sm_on($cfg, 'CHECK_SYSTEM')) $out['system'] = sm_get_system();
+unset($out['system']['boot_id']);
+
+if (sm_on($cfg, 'CHECK_DISKS')) {
+    $disks = sm_get_disks();
+    if ($disks !== null) {
+        foreach ($disks as &$d) {
+            $d['smart'] = $state['smart'][$d['id']] ?? null;
+            unset($d['id']);   // enthält meist die Seriennummer, im Browser nicht nötig
+        }
+        unset($d);
+    }
+    $out['disks'] = $disks;
+}
+if (sm_on($cfg, 'CHECK_SPACE'))   $out['space']  = sm_get_space(sm_list($cfg['SPACE_PATHS'] ?? ''));
+if (sm_on($cfg, 'CHECK_DOCKER')) {
+    $out['docker']       = sm_get_docker();
+    $out['docker_watch'] = sm_list($cfg['DOCKER_WATCH'] ?? '');
+    if (is_array($out['docker'])) {
+        $avail = array_map('sm_norm_image', sm_get_updates() ?? []);
+        foreach ($out['docker'] as &$c) {
+            $img = $state['docker_img'][$c['name']] ?? null;   // Stand der letzten Prüfung
+            $c['version']          = $img['version'] ?? '';
+            $c['updated']          = $img['updated'] ?? null;
+            $c['update_available'] = $img !== null && in_array(sm_norm_image((string)$img['image']), $avail, true);
+        }
+        unset($c);
+    }
+}
+if (sm_on($cfg, 'CHECK_VMS')) {
+    $out['vms']      = sm_get_vms();
+    $out['vm_watch'] = sm_list($cfg['VM_WATCH'] ?? '');
+}
+if (sm_on($cfg, 'CHECK_UPS'))     $out['ups']     = sm_get_ups();
+if (sm_on($cfg, 'CHECK_UPDATES')) $out['updates'] = sm_get_updates();
+if (sm_on($cfg, 'CHECK_CERTS')) {
+    // Ergebnis des letzten Prüflaufs; TLS-Handshakes laufen nicht bei jedem Seitenaufruf
+    $certs = json_decode((string)@file_get_contents(SM_TMP . '/certs.json'), true);
+    $out['certs'] = is_array($certs) ? $certs : null;
+    $out['thresholds']['cert'] = [sm_num($cfg, 'CERT_WARN_DAYS', 20), sm_num($cfg, 'CERT_CRIT_DAYS', 7)];
+}
+
+echo json_encode($out, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+]]></INLINE>
+</FILE>
+
+<FILE Name="&emhttp;/scripts/check.php" Mode="0755">
+<INLINE><![CDATA[#!/usr/bin/php
+<?php
+/*
+ * srvmon - Zustandsüberwachung für Unraid
+ *
+ * Aufruf:  check.php [--force] [--dry-run] [--test]
+ *   --force    Intervall ignorieren und sofort prüfen
+ *   --dry-run  Nur ausgeben, nichts senden, Zustand nicht speichern
+ *   --test     Testbenachrichtigung senden
+ *
+ * Versand ausschließlich über Unraids notify-Skript. Ob eine Mail
+ * rausgeht, steuern die Agenten unter Settings > Notifications.
+ */
+declare(strict_types=1);
+require_once '/usr/local/emhttp/plugins/srvmon/include/lib.php';
+
+const SM_MAX_PER_RUN = 10;
+const SM_MAX_HOOKS   = 3;     // Webhook-Aufrufe pro Lauf, damit Alexa bei vielen Meldungen nicht minutenlang spricht
+
+$opt   = getopt('', ['force', 'dry-run', 'test']);
+$force = isset($opt['force']);
+$dry   = isset($opt['dry-run']);
+$cfg   = sm_load_cfg();
+
+if (isset($opt['test'])) {
+    sm_send('normal', 'Testbenachrichtigung',
+        'srvmon ist aktiv. Kommt diese Nachricht an, ist der Versand korrekt eingerichtet.', true);
+    exit(0);
+}
+
+@mkdir(SM_TMP, 0755, true);
+$lock = fopen(SM_TMP . '/lock', 'c');
+if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) exit(0);
+
+$runFile  = SM_TMP . '/lastrun';
+$interval = max(1, (int)sm_num($cfg, 'INTERVAL', 5)) * 60;
+$last     = (int)@file_get_contents($runFile);
+if (!$force && time() - $last < $interval - 10) exit(0);
+if (!$dry) file_put_contents($runFile, (string)time());
+
+$state  = sm_load_state();
+$issues = [];   // anhaltende Zustände: key => [level, subject, desc]
+$events = [];   // einmalige Ereignisse: [level, subject, desc]
+$ran    = [];   // Schlüssel-Präfixe der Checks, die Daten liefern konnten
+
+if (sm_on($cfg, 'CHECK_DISKS'))   sm_check_disks($cfg, $state, $issues, $events, $ran);
+if (sm_on($cfg, 'CHECK_SPACE'))   sm_check_space($cfg, $issues, $ran);
+if (sm_on($cfg, 'CHECK_DOCKER'))  sm_check_docker($cfg, $state, $issues, $events, $ran);
+if (sm_on($cfg, 'CHECK_DOCKER') && sm_on($cfg, 'CHECK_DOCKER_UPDATED')) sm_check_docker_updated($state, $events);
+if (sm_on($cfg, 'CHECK_VMS'))     sm_check_vms($cfg, $state, $issues, $events, $ran);
+if (sm_on($cfg, 'CHECK_SYSTEM'))  sm_check_system($cfg, $state, $issues, $events, $ran);
+if (sm_on($cfg, 'CHECK_UPS'))     sm_check_ups($issues, $ran);
+if (sm_on($cfg, 'CHECK_UPDATES')) sm_check_updates($state, $events);
+if (sm_on($cfg, 'CHECK_CERTS'))   sm_check_certs($cfg, $force, $state, $issues, $ran);
+
+// ---------------------------------------------------------------- Auswertung
+$now    = time();
+$remind = (int)sm_num($cfg, 'REMIND_HOURS', 24) * 3600;
+$prev   = $state['issues'] ?? [];
+$next   = [];
+$queue  = [];
+
+foreach ($issues as $key => [$lvl, $subj, $desc]) {
+    $p = $prev[$key] ?? null;
+    if ($p === null || sm_rank($lvl) > sm_rank((string)$p['level'])) {
+        $queue[] = [$lvl, $subj, $desc];
+        $next[$key] = ['level' => $lvl, 'subject' => $subj, 'desc' => $desc,
+                       'since' => $p['since'] ?? $now, 'notified' => $now];
+    } elseif ($remind > 0 && $now - (int)$p['notified'] >= $remind) {
+        $queue[] = [$lvl, "Weiterhin: $subj",
+                    $desc . ' (besteht seit ' . date('d.m.Y H:i', (int)$p['since']) . ')'];
+        $next[$key] = ['level' => $lvl, 'subject' => $subj, 'desc' => $desc,
+                       'since' => $p['since'], 'notified' => $now];
+    } else {
+        // Beschreibung nicht aktualisieren, sonst würde der Flash bei jedem Lauf beschrieben
+        $p['level'] = $lvl;
+        $next[$key] = $p;
+    }
+}
+foreach ($prev as $key => $p) {
+    if (isset($next[$key])) continue;
+    if (!sm_prefix_ran((string)$key, $ran)) { $next[$key] = $p; continue; }   // Check lief nicht: nichts entscheiden
+    if (sm_on($cfg, 'NOTIFY_RESOLVED')) {
+        $queue[] = ['normal', 'Behoben: ' . $p['subject'], 'Der Zustand ist wieder in Ordnung.'];
+    }
+}
+$state['issues'] = $next;
+$queue = array_merge($queue, $events);
+
+$sent = 0;
+foreach ($queue as [$lvl, $subj, $desc]) {
+    if ($sent >= SM_MAX_PER_RUN) {
+        sm_send('warning', 'Weitere Meldungen unterdrückt',
+            (count($queue) - $sent) . ' weitere Meldungen in diesem Durchlauf. Details im Syslog (Tag srvmon).');
+        break;
+    }
+    sm_send($lvl, $subj, $desc);
+    $sent++;
+}
+
+sm_webhook_flush();
+
+if (!$dry) {
+    // Heartbeat für externe Überwachung (z. B. healthchecks.io, Uptime Kuma Push); im Hintergrund, blockiert nicht
+    $hb = trim((string)($cfg['HEARTBEAT_URL'] ?? ''));
+    if ($hb !== '') exec('curl -fsS -m 10 --retry 2 -o /dev/null ' . escapeshellarg($hb) . ' >/dev/null 2>&1 &');
+    sm_save_state($state);
+    @file_put_contents(SM_TMP . '/status.json', json_encode(
+        ['lastrun' => $now, 'issues' => $next], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+}
+exit(0);
+
+// ================================================================== Checks
+
+function sm_check_disks(array $cfg, array &$state, array &$issues, array &$events, array &$ran): void
+{
+    $disks = sm_get_disks();
+    if ($disks === null) return;
+    $ran[] = 'disk:';
+    $smartOn = sm_on($cfg, 'CHECK_SMART');
+    if ($smartOn) $ran[] = 'smart:';
+
+    foreach ($disks as $d) {
+        ['name' => $name, 'device' => $dev, 'status' => $status] = $d;
+
+        if ($status !== 'DISK_OK') {
+            $issues["disk:$name:status"] = ['alert', "Disk $name: Status $status",
+                "Disk $name (" . ($dev !== '' ? $dev : 'kein Gerät erkannt') . ") meldet den Status $status."];
+        }
+        if ($d['errors'] > 0) {
+            $issues["disk:$name:errors"] = ['alert', "Disk $name: E/A-Fehler",
+                "Unraid zählt {$d['errors']} Lese-/Schreibfehler auf Disk $name ($dev)."];
+        }
+        if ($d['type'] === 'Flash') continue;
+
+        if ($d['temp'] !== null) {
+            $t = $d['temp'];
+            $w = sm_num($cfg, $d['nvme'] ? 'TEMP_NVME_WARN' : 'TEMP_HDD_WARN', $d['nvme'] ? 60 : 45);
+            $c = sm_num($cfg, $d['nvme'] ? 'TEMP_NVME_CRIT' : 'TEMP_HDD_CRIT', $d['nvme'] ? 70 : 50);
+            if ($t >= $c) {
+                $issues["disk:$name:temp"] = ['alert', "Disk $name: Temperatur kritisch",
+                    "Disk $name ($dev) hat {$t} °C (kritisch ab {$c} °C)."];
+            } elseif ($t >= $w) {
+                $issues["disk:$name:temp"] = ['warning', "Disk $name: Temperatur hoch",
+                    "Disk $name ($dev) hat {$t} °C (Warnung ab {$w} °C)."];
+            }
+        }
+        if ($smartOn && $dev !== '') sm_check_smart($d, $state, $issues, $events);
+    }
+}
+
+function sm_check_smart(array $d, array &$state, array &$issues, array &$events): void
+{
+    ['name' => $name, 'device' => $dev, 'id' => $id] = $d;
+    $s = sm_get_smart($dev);
+    if ($s === null) {                       // Standby oder nicht lesbar: bisherigen Zustand behalten
+        sm_keep($state, $issues, "smart:$name:");
+        return;
+    }
+    if (!$s['passed']) {
+        $issues["smart:$name:health"] = ['alert', "Disk $name: SMART-Status FAILED",
+            "Der SMART-Gesamtstatus von Disk $name ($dev) ist FAILED. Disk zeitnah ersetzen."];
+    }
+    if ($s['nvme_cw']) {
+        $issues["smart:$name:nvme_cw"] = ['alert', "Disk $name: NVMe Critical Warning",
+            sprintf('Disk %s (%s) meldet critical_warning = 0x%02x.', $name, $dev, $s['nvme_cw'])];
+    }
+    if ($s['wear'] !== null && $s['wear'] >= 90) {
+        $issues["smart:$name:wear"] = ['warning', "Disk $name: Verschleiß {$s['wear']} %",
+            "Disk $name ($dev) hat laut SMART {$s['wear']} % ihrer Lebensdauer verbraucht."];
+    }
+
+    $base = $state['smart'][$id]['counters'] ?? [];
+    $save = [];
+    foreach ($s['counters'] as $label => [$val, $lvl]) {
+        $old = (int)($base[$label] ?? 0);    // ohne Baseline wird ein Wert > 0 einmalig gemeldet
+        if ($val > $old) {
+            $events[] = [$lvl, "Disk $name: $label gestiegen",
+                "Disk $name ($dev): $label von $old auf $val gestiegen."];
+        }
+        $save[$label] = $val;
+    }
+    // Wird auch von der Statusseite angezeigt (letzter bekannter Stand)
+    $state['smart'][$id] = ['passed' => $s['passed'], 'wear' => $s['wear'], 'counters' => $save];
+}
+
+function sm_check_space(array $cfg, array &$issues, array &$ran): void
+{
+    $ran[] = 'space:';
+    $w = sm_num($cfg, 'SPACE_WARN', 85);
+    $c = sm_num($cfg, 'SPACE_CRIT', 95);
+    foreach (sm_get_space(sm_list($cfg['SPACE_PATHS'] ?? '')) as $s) {
+        $p   = $s['path'];
+        $txt = sprintf('%s ist zu %.1f %% belegt (frei: %s).', $p, $s['pct'], sm_bytes((float)$s['free']));
+        if ($s['pct'] >= $c)     $issues["space:$p"] = ['alert',   "Speicher fast voll: $p", $txt];
+        elseif ($s['pct'] >= $w) $issues["space:$p"] = ['warning', "Speicher wird knapp: $p", $txt];
+    }
+}
+
+function sm_check_docker(array $cfg, array &$state, array &$issues, array &$events, array &$ran): void
+{
+    $list = sm_get_docker();
+    if ($list === null) return;
+    $ran[] = 'docker:';
+
+    $watch = sm_list($cfg['DOCKER_WATCH'] ?? '');
+    $all   = in_array('*', $watch, true);
+    $prev  = $state['docker'] ?? [];
+    $now   = [];
+
+    foreach ($list as ['name' => $n, 'state' => $st, 'status' => $status, 'unhealthy' => $bad]) {
+        $now[$n] = $st;
+        if ($bad) {
+            $issues["docker:$n:health"] = ['warning', "Container $n: unhealthy",
+                "Der Healthcheck von Container $n schlägt fehl ($status)."];
+        }
+        if (!$all && in_array($n, $watch, true) && $st !== 'running') {
+            $issues["docker:$n:down"] = ['alert', "Container $n läuft nicht",
+                "Überwachter Container $n hat den Zustand '$st' ($status)."];
+        }
+        if ($all && ($prev[$n] ?? '') === 'running' && $st !== 'running') {
+            $events[] = ['warning', "Container $n wurde beendet", "Container $n: $status"];
+        }
+    }
+    foreach ($watch as $n) {
+        if ($n !== '*' && !isset($now[$n])) {
+            $issues["docker:$n:missing"] = ['warning', "Container $n nicht gefunden",
+                "Der überwachte Container $n existiert nicht (Name in den Einstellungen prüfen)."];
+        }
+    }
+    $state['docker'] = $now;
+}
+
+function sm_check_docker_updated(array &$state, array &$events): void
+{
+    $imgs = sm_get_docker_images();
+    if ($imgs === null) return;
+    $prev = $state['docker_img'] ?? [];
+    $now  = [];
+    foreach ($imgs as $n => $c) {
+        $p = $prev[$n] ?? null;
+        $e = ['id' => $c['id'], 'image' => $c['image'], 'version' => $c['version'], 'updated' => $p['updated'] ?? null];
+        if (is_array($p) && $p['id'] !== $c['id']) {          // neues Image bei bestehendem Container
+            $e['updated'] = time();
+            if (sm_norm_image((string)$p['image']) !== sm_norm_image($c['image'])) {
+                $events[] = ['normal', "Container $n: Image gewechselt",
+                    "Container $n nutzt jetzt {$c['image']} statt {$p['image']}."];
+            } else {
+                $ver = ($p['version'] !== '' || $c['version'] !== '')
+                    ? sprintf(' Version: %s -> %s.', $p['version'] ?: '?', $c['version'] ?: '?') : '';
+                $events[] = ['normal', "Container $n aktualisiert",
+                    "Container $n wurde mit einem neuen Image gestartet ({$c['image']}).$ver"];
+            }
+        }
+        $now[$n] = $e;
+    }
+    $state['docker_img'] = $now;
+}
+
+function sm_check_vms(array $cfg, array &$state, array &$issues, array &$events, array &$ran): void
+{
+    $list = sm_get_vms();
+    if ($list === null) return;
+    $ran[] = 'vm:';
+
+    $watch = sm_list($cfg['VM_WATCH'] ?? '');
+    $all   = in_array('*', $watch, true);
+    $prev  = $state['vms'] ?? [];
+    $now   = [];
+
+    foreach ($list as ['name' => $vm, 'state' => $st]) {
+        $now[$vm] = $st;
+        if ($st === 'crashed') {
+            $issues["vm:$vm:crashed"] = ['alert', "VM $vm abgestürzt", "VM $vm hat den Zustand 'crashed'."];
+        }
+        if (!$all && in_array($vm, $watch, true) && $st !== 'running') {
+            $issues["vm:$vm:down"] = ['alert', "VM $vm läuft nicht", "Überwachte VM $vm hat den Zustand '$st'."];
+        }
+        if ($all && ($prev[$vm] ?? '') === 'running' && $st !== 'running') {
+            $events[] = ['warning', "VM $vm wurde beendet", "VM $vm hat jetzt den Zustand '$st'."];
+        }
+    }
+    $state['vms'] = $now;
+}
+
+function sm_check_system(array $cfg, array &$state, array &$issues, array &$events, array &$ran): void
+{
+    $ran[] = 'sys:';
+    $s = sm_get_system();
+
+    // Neustart erkennen (boot_id ändert sich bei jedem Boot)
+    if ($s['boot_id'] !== '') {
+        if (isset($state['boot_id']) && $state['boot_id'] !== $s['boot_id']) {
+            $events[] = ['warning', 'Server wurde neu gestartet',
+                sprintf('Der Server läuft seit %d min. War der Neustart nicht geplant, Syslog prüfen.', intdiv($s['uptime'], 60))];
+        }
+        $state['boot_id'] = $s['boot_id'];
+    }
+
+    $w = sm_num($cfg, 'CPU_LOAD_WARN', 90);
+    if ($s['load_pct'] !== null && $s['load_pct'] >= $w) {
+        $issues['sys:load'] = ['warning', 'Hohe CPU-Last',
+            sprintf('5-Minuten-Load %.2f bei %d CPUs (%.0f %%, Warnung ab %.0f %%).', $s['load'][1], $s['cores'], $s['load_pct'], $w)];
+    }
+
+    // Hinweis: ZFS-ARC zählt hier als belegt
+    $w = sm_num($cfg, 'RAM_WARN', 90);
+    if ($s['mem_pct'] !== null && $s['mem_pct'] >= $w) {
+        $issues['sys:ram'] = ['warning', 'Arbeitsspeicher knapp',
+            sprintf('%.1f %% belegt, verfügbar: %s.', $s['mem_pct'], sm_bytes((float)$s['mem_avail']))];
+    }
+}
+
+function sm_check_ups(array &$issues, array &$ran): void
+{
+    $u = sm_get_ups();
+    if ($u === null) return;
+    $ran[] = 'ups:';
+    $st     = $u['status'];
+    $detail = sprintf('Status: %s, Ladung: %s, Restlaufzeit: %s.', $st, $u['charge'] ?: '?', $u['timeleft'] ?: '?');
+    if (stripos($st, 'ONBATT') !== false) {
+        $issues['ups:onbatt'] = ['alert', 'Stromausfall: USV im Batteriebetrieb', $detail];
+    } elseif (stripos($st, 'COMMLOST') !== false) {
+        $issues['ups:comm'] = ['warning', 'Keine Verbindung zur USV', $detail];
+    }
+    if (stripos($st, 'REPLACEBATT') !== false) {
+        $issues['ups:battery'] = ['warning', 'USV-Batterie tauschen', $detail];
+    }
+}
+
+function sm_check_certs(array $cfg, bool $force, array &$state, array &$issues, array &$ran): void
+{
+    global $dry;
+    // Zertifikate ändern sich selten: höchstens einmal pro Stunde prüfen
+    $stamp = SM_TMP . '/lastcert';
+    if (!$force && time() - (int)@file_get_contents($stamp) < 3600 - 10) {
+        sm_keep($state, $issues, 'cert:');
+        return;
+    }
+    if (!$dry) file_put_contents($stamp, (string)time());
+
+    $now    = time();
+    $warn   = sm_num($cfg, 'CERT_WARN_DAYS', 20);
+    $crit   = sm_num($cfg, 'CERT_CRIT_DAYS', 7);
+    $ignore = array_map('strtolower', sm_list($cfg['CERT_IGNORE'] ?? ''));
+    $items  = [];   // für die Statusseite
+
+    $grade = function (int $exp) use ($now, $warn, $crit): array {
+        $days = (int)floor(($exp - $now) / 86400);
+        if ($exp <= $now)    return [$days, 'alert', 'ist abgelaufen'];
+        if ($days <= $crit)  return [$days, 'alert', "läuft in $days Tagen ab"];
+        if ($days <= $warn)  return [$days, 'warning', "läuft in $days Tagen ab"];
+        return [$days, null, "gültig, noch $days Tage"];
+    };
+
+    // --- Zertifikatsdateien
+    $fileCerts = [];
+    $dirs = sm_list($cfg['CERT_DIRS'] ?? '');
+    if ($dirs) {
+        $ran[] = 'cert:file:';
+        $res   = sm_get_cert_files($dirs);
+        foreach ($res['missing'] as $d) {
+            $issues["cert:file:missing:$d"] = ['warning', 'Zertifikatsverzeichnis nicht gefunden',
+                "Das Verzeichnis $d existiert nicht. Pfad in den Einstellungen (CERT_DIRS) prüfen."];
+        }
+        // Ersetzte Zertifikate erkennen: Ein anderes Zertifikat deckt alle Namen ab und läuft später ab.
+        // NPM legt bei einer Neuanlage ein neues Verzeichnis npm-<id> an, das alte bleibt teils liegen.
+        $valid = array_filter($res['certs'], fn($x) => !isset($x['error']));
+        $supersededBy = function (array $c) use ($valid): ?string {
+            foreach ($valid as $o) {
+                if ($o['id'] === $c['id'] || $o['expires'] <= $c['expires']) continue;
+                $all = true;
+                foreach ($c['names'] as $n) { if (!sm_cert_covers($o['names'], $n)) { $all = false; break; } }
+                if ($all && $c['names']) return $o['id'];
+            }
+            return null;
+        };
+        foreach ($res['certs'] as $c) {
+            $label = isset($c['names'][0]) ? $c['names'][0] : $c['id'];
+            if (isset($c['error'])) {
+                $issues["cert:file:{$c['id']}"] = ['warning', "Zertifikat $label nicht lesbar", "Datei: {$c['path']}"];
+                $items[] = ['source' => 'Datei', 'name' => $label, 'id' => $c['id'], 'error' => $c['error']];
+                continue;
+            }
+            if (array_intersect(array_map('strtolower', $c['names']), $ignore)) continue;
+            $fileCerts[] = $c;
+            $newer = $supersededBy($c);
+            if ($newer !== null) {
+                $items[] = ['source' => 'Datei', 'name' => $label, 'id' => $c['id'], 'names' => $c['names'],
+                            'issuer' => $c['issuer'], 'expires' => $c['expires'],
+                            'days' => (int)floor(($c['expires'] - $now) / 86400), 'level' => null,
+                            'superseded' => $newer];
+                continue;
+            }
+            [$days, $lvl, $txt] = $grade($c['expires']);
+            if ($lvl !== null) {
+                $issues["cert:file:{$c['id']}"] = [$lvl, "Zertifikat $label $txt",
+                    sprintf('Zertifikat für %s (%s, Aussteller %s) gültig bis %s. Let\'s Encrypt erneuert normalerweise 30 Tage vor Ablauf; prüfe die Erneuerung in Nginx Proxy Manager.',
+                        implode(', ', $c['names']), $c['id'], $c['issuer'] ?: '?', date('d.m.Y H:i', $c['expires']))];
+            }
+            $items[] = ['source' => 'Datei', 'name' => $label, 'id' => $c['id'], 'names' => $c['names'],
+                        'issuer' => $c['issuer'], 'expires' => $c['expires'], 'days' => $days, 'level' => $lvl];
+        }
+    }
+
+    // --- Ausgelieferte Zertifikate
+    $hosts = sm_list($cfg['CERT_HOSTS'] ?? '');
+    if ($hosts) {
+        $ran[] = 'cert:live:';
+        foreach ($hosts as $entry) {
+            $r = sm_get_cert_live($entry);
+            $h = $r['host'];
+            if ($r['error'] !== null) {
+                $hint = $r['addr'] === $h
+                    ? " Erreicht der Server seine öffentliche Adresse nicht (kein NAT-Loopback am Router), den Eintrag als $h@<LAN-IP>:<NPM-HTTPS-Port> angeben."
+                    : ' Läuft Nginx Proxy Manager und stimmt der Port?';
+                $issues["cert:live:$h:conn"] = ['warning', "TLS-Prüfung für $h fehlgeschlagen", $r['error'] . '.' . $hint];
+                $items[] = ['source' => 'Live', 'name' => $h, 'error' => $r['error']];
+                continue;
+            }
+            [$days, $lvl, $txt] = $grade($r['expires']);
+            if ($lvl !== null) {
+                $issues["cert:live:$h:expiry"] = [$lvl, "Ausgeliefertes Zertifikat für $h $txt",
+                    sprintf('%s:%d liefert ein Zertifikat (Aussteller %s), das bis %s gültig ist.',
+                        $r['addr'], $r['port'], $r['issuer'] ?: '?', date('d.m.Y H:i', $r['expires']))];
+            }
+            $verr = null;
+            if (sm_on($cfg, 'CERT_VERIFY') && $r['verify'] !== null && $r['verify']['code'] !== 0) {
+                $verr = $r['verify']['text'];
+                $issues["cert:live:$h:verify"] = ['warning', "Zertifikat für $h nicht vertrauenswürdig",
+                    "Die Prüfung meldet: $verr (Code {$r['verify']['code']}). Ursachen: falscher Hostname, fehlende Zwischenzertifikate oder selbstsigniertes Zertifikat."];
+            }
+            // Vergleich mit der Datei: liefert nginx noch ein älteres Zertifikat aus?
+            $stale = false;
+            foreach ($fileCerts as $fc) {
+                if (sm_cert_covers($fc['names'], $h) && $fc['expires'] > $r['expires'] + 86400) {
+                    $stale = true;
+                    $issues["cert:live:$h:stale"] = ['warning', "Veraltetes Zertifikat für $h ausgeliefert",
+                        sprintf('Im Dateisystem liegt ein Zertifikat bis %s, ausgeliefert wird eines bis %s. Nginx Proxy Manager hat die Erneuerung vermutlich nicht geladen; Container neu starten.',
+                            date('d.m.Y', $fc['expires']), date('d.m.Y', $r['expires']))];
+                    break;
+                }
+            }
+            $items[] = ['source' => 'Live', 'name' => $h, 'names' => $r['names'], 'issuer' => $r['issuer'],
+                        'expires' => $r['expires'], 'days' => $days, 'level' => $lvl,
+                        'verify' => $verr, 'stale' => $stale];
+        }
+    }
+
+    if (!$dry) {
+        @file_put_contents(SM_TMP . '/certs.json',
+            json_encode(['time' => $now, 'items' => $items], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+    }
+}
+
+function sm_check_updates(array &$state, array &$events): void
+{
+    $avail = sm_get_updates();
+    if ($avail === null) return;
+    $new = array_values(array_diff($avail, $state['updates'] ?? []));
+    if ($new) {
+        // Images den Containern zuordnen, damit die Meldung die Containernamen nennt
+        $items = [];
+        foreach ($new as $img) {
+            $names = [];
+            foreach ($state['docker_img'] ?? [] as $n => $c) {
+                if (sm_norm_image((string)$c['image']) === sm_norm_image($img)) $names[] = $n;
+            }
+            $items[] = $names ? implode(', ', $names) . " ($img)" : $img;
+        }
+        $events[] = ['normal', count($new) . ' Docker-Update(s) verfügbar',
+            implode('; ', $items) . '. Aktualisieren über den Docker-Tab.'];
+    }
+    $state['updates'] = $avail;
+}
+
+// ================================================================== Hilfen
+
+function sm_send(string $lvl, string $subj, string $desc, bool $forceHook = false): void
+{
+    global $dry, $cfg, $smHookSent, $smHookSkipped;
+    $url  = trim((string)($cfg['WEBHOOK_URL'] ?? ''));
+    $hook = $url !== '' && ($forceHook || sm_rank($lvl) >= sm_rank((string)($cfg['WEBHOOK_LEVEL'] ?? 'warning')));
+    if ($dry) { echo "[$lvl] $subj - $desc" . ($hook ? ' [+Webhook]' : '') . "\n"; return; }
+
+    exec(SM_NOTIFY
+        . ' -e ' . escapeshellarg('Server Monitor')
+        . ' -s ' . escapeshellarg("srvmon: $subj")
+        . ' -d ' . escapeshellarg($desc)
+        . ' -i ' . escapeshellarg($lvl)
+        . ' >/dev/null 2>&1');
+    exec('logger -t srvmon ' . escapeshellarg("[$lvl] $subj - $desc"));
+
+    if (!$hook) return;
+    if ((int)$smHookSent >= SM_MAX_HOOKS) { $smHookSkipped = (int)$smHookSkipped + 1; return; }
+    $smHookSent = (int)$smHookSent + 1;
+    $host  = gethostname() ?: 'Unraid';
+    $intro = ['alert' => 'Alarm', 'warning' => 'Warnung'][$lvl] ?? 'Hinweis';
+    sm_webhook($url, [
+        'level' => $lvl, 'subject' => $subj, 'description' => $desc,
+        'speech' => "$intro vom Server $host: $subj",
+        'host' => $host, 'time' => time(),
+    ]);
+}
+
+/** Nach dem Versand: übersprungene Webhook-Meldungen in einer Sammelmeldung zusammenfassen. */
+function sm_webhook_flush(): void
+{
+    global $dry, $cfg, $smHookSkipped;
+    if ($dry || (int)$smHookSkipped === 0) return;
+    $host = gethostname() ?: 'Unraid';
+    sm_webhook(trim((string)$cfg['WEBHOOK_URL']), [
+        'level' => 'warning', 'subject' => "$smHookSkipped weitere Meldungen",
+        'description' => 'Details in den Unraid-Benachrichtigungen.',
+        'speech' => "Der Server $host hat $smHookSkipped weitere Meldungen. Details in Unraid.",
+        'host' => $host, 'time' => time(),
+    ]);
+}
+
+function sm_webhook(string $url, array $payload): void
+{
+    $json = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    $out = []; $rc = 0;
+    exec('curl -fsS -m 10 -X POST -H ' . escapeshellarg('Content-Type: application/json')
+         . ' --data-binary ' . escapeshellarg((string)$json) . ' ' . escapeshellarg($url) . ' 2>&1', $out, $rc);
+    if ($rc !== 0) {
+        // Webhook-Ziel nicht erreichbar (z. B. Home Assistant gestoppt): nur protokollieren,
+        // die Unraid-Benachrichtigung ist bereits verschickt.
+        exec('logger -t srvmon ' . escapeshellarg('Webhook fehlgeschlagen (curl ' . $rc . '): ' . implode(' ', $out)));
+    }
+}
+
+function sm_keep(array $state, array &$issues, string $prefix): void
+{
+    foreach ($state['issues'] ?? [] as $k => $p) {
+        if (strncmp((string)$k, $prefix, strlen($prefix)) === 0) {
+            $issues[$k] = [(string)$p['level'], (string)$p['subject'], (string)$p['desc']];
+        }
+    }
+}
+
+function sm_prefix_ran(string $key, array $ran): bool
+{
+    foreach ($ran as $p) if (strncmp($key, $p, strlen($p)) === 0) return true;
+    return false;
+}
+
+function sm_rank(string $l): int
+{
+    return ['normal' => 0, 'warning' => 1, 'alert' => 2][$l] ?? 0;
+}
+]]></INLINE>
+</FILE>
+
+<FILE Name="&emhttp;/srvmon.page">
+<INLINE><![CDATA[Menu="Utilities"
+Title="Server Monitor"
+Icon="heartbeat"
+---
+<?php
+$sm = array_merge(
+    @parse_ini_file('/usr/local/emhttp/plugins/srvmon/default.cfg') ?: [],
+    @parse_ini_file('/boot/config/plugins/srvmon/srvmon.cfg') ?: []
+);
+$smStatus = json_decode((string)@file_get_contents('/tmp/srvmon/status.json'), true) ?: [];
+if (!function_exists('sm_v')) {
+    function sm_v(array $c, string $k): string {
+        return htmlspecialchars((string)($c[$k] ?? ''), ENT_QUOTES);
+    }
+    function sm_lvl(array $c, string $k): string {
+        $cur = (string)($c[$k] ?? 'warning');
+        $o = '';
+        foreach (['normal' => 'Alles (ab Notice)', 'warning' => 'Warnings und Alerts', 'alert' => 'Nur Alerts'] as $v => $t) {
+            $o .= '<option value="' . $v . '"' . ($cur === $v ? ' selected' : '') . '>' . $t . '</option>';
+        }
+        return '<select name="' . $k . '">' . $o . '</select>';
+    }
+    function sm_yn(array $c, string $k): string {
+        $on = in_array(strtolower((string)($c[$k] ?? '')), ['1', 'yes', 'true', 'on'], true);
+        return '<select name="' . $k . '">'
+             . '<option value="yes"' . ($on ? ' selected' : '') . '>Ja</option>'
+             . '<option value="no"'  . ($on ? '' : ' selected') . '>Nein</option></select>';
+    }
+}
+?>
+<style>
+.srvmon-sec{font-weight:bold;font-size:1.1em;margin:2.2em 0 .9em;padding-bottom:.35em;border-bottom:1px solid rgba(127,127,127,.4)}
+.srvmon-sec.first{margin-top:.5em}
+.srvmon-sec small{font-weight:normal;opacity:.7;margin-left:.6em}
+</style>
+<div style="margin:0 0 1.5em 0">
+<p><b>Letzter Lauf:</b> <?= isset($smStatus['lastrun']) ? date('d.m.Y H:i:s', (int)$smStatus['lastrun']) : 'noch keiner' ?></p>
+<?php if (empty($smStatus['issues'])): ?>
+<p>Keine aktiven Probleme.</p>
+<?php else: ?>
+<table class="tablesorter"><thead><tr><th>Level</th><th>Problem</th><th>Seit</th></tr></thead><tbody>
+<?php foreach ($smStatus['issues'] as $i): ?>
+<tr><td><?= htmlspecialchars((string)$i['level']) ?></td><td><?= htmlspecialchars((string)$i['subject']) ?><br><small><?= htmlspecialchars((string)$i['desc']) ?></small></td><td><?= date('d.m.Y H:i', (int)$i['since']) ?></td></tr>
+<?php endforeach; ?>
+</tbody></table>
+<?php endif; ?>
+<p><small>Mails verschickt Unraids Benachrichtigungssystem. SMTP und die E-Mail-Agenten pro Level richtest du unter Settings &gt; Notifications ein. Update-Meldungen haben das Level Notice: Für Mails dazu dort den E-Mail-Agenten für Notices aktivieren. Verfügbare Docker-Updates stammen aus Unraids eigener Update-Prüfung; deren Zeitplan legst du ebenfalls unter Settings &gt; Notifications fest.</small></p>
+</div>
+
+<form markdown="1" name="srvmon_settings" method="POST" action="/update.php" target="progressFrame">
+<input type="hidden" name="#file" value="srvmon/srvmon.cfg">
+<input type="hidden" name="csrf_token" value="<?=htmlspecialchars((string)($var['csrf_token'] ?? ''), ENT_QUOTES)?>">
+
+<div class="srvmon-sec first">Allgemein</div>
+
+Prüfintervall (Minuten):
+: <input type="number" name="INTERVAL" min="1" max="1440" value="<?=sm_v($sm,'INTERVAL')?>">
+
+Erinnerung bei anhaltenden Problemen (Stunden, 0 = aus):
+: <input type="number" name="REMIND_HOURS" min="0" value="<?=sm_v($sm,'REMIND_HOURS')?>" style="width:6em">
+
+Meldung, wenn ein Problem behoben ist:
+: <?=sm_yn($sm,'NOTIFY_RESOLVED')?>
+
+<div class="srvmon-sec">Disks und SMART</div>
+
+Disks prüfen (Status, Fehler, Temperatur):
+: <?=sm_yn($sm,'CHECK_DISKS')?>
+
+SMART-Werte prüfen (weckt keine Disks):
+: <?=sm_yn($sm,'CHECK_SMART')?>
+
+HDD-Temperatur Warnung / Kritisch (°C):
+: <input type="number" name="TEMP_HDD_WARN" value="<?=sm_v($sm,'TEMP_HDD_WARN')?>" style="width:6em"> <input type="number" name="TEMP_HDD_CRIT" value="<?=sm_v($sm,'TEMP_HDD_CRIT')?>" style="width:6em">
+
+NVMe-Temperatur Warnung / Kritisch (°C):
+: <input type="number" name="TEMP_NVME_WARN" value="<?=sm_v($sm,'TEMP_NVME_WARN')?>" style="width:6em"> <input type="number" name="TEMP_NVME_CRIT" value="<?=sm_v($sm,'TEMP_NVME_CRIT')?>" style="width:6em">
+
+<div class="srvmon-sec">Speicherplatz</div>
+
+Speicherplatz prüfen:
+: <?=sm_yn($sm,'CHECK_SPACE')?>
+
+Pfade (kommagetrennt):
+: <input type="text" name="SPACE_PATHS" value="<?=sm_v($sm,'SPACE_PATHS')?>" style="width:30em">
+
+Belegung Warnung / Kritisch (%):
+: <input type="number" name="SPACE_WARN" min="1" max="100" value="<?=sm_v($sm,'SPACE_WARN')?>" style="width:6em"> <input type="number" name="SPACE_CRIT" min="1" max="100" value="<?=sm_v($sm,'SPACE_CRIT')?>" style="width:6em">
+
+<div class="srvmon-sec">Docker</div>
+
+Container prüfen:
+: <?=sm_yn($sm,'CHECK_DOCKER')?>
+
+Überwachte Container:
+: <input type="text" name="DOCKER_WATCH" value="<?=sm_v($sm,'DOCKER_WATCH')?>" style="width:30em" placeholder="* oder Namen, kommagetrennt">
+
+Verfügbare Updates melden:
+: <?=sm_yn($sm,'CHECK_UPDATES')?>
+
+Durchgeführte Updates melden:
+: <?=sm_yn($sm,'CHECK_DOCKER_UPDATED')?>
+
+<div class="srvmon-sec">VMs</div>
+
+VMs prüfen:
+: <?=sm_yn($sm,'CHECK_VMS')?>
+
+Überwachte VMs:
+: <input type="text" name="VM_WATCH" value="<?=sm_v($sm,'VM_WATCH')?>" style="width:30em" placeholder="* oder Namen, kommagetrennt">
+
+<div class="srvmon-sec">System und USV</div>
+
+System prüfen (CPU, RAM, Neustart):
+: <?=sm_yn($sm,'CHECK_SYSTEM')?>
+
+CPU-Last Warnung (% der Kerne):
+: <input type="number" name="CPU_LOAD_WARN" min="1" value="<?=sm_v($sm,'CPU_LOAD_WARN')?>" style="width:6em">
+
+RAM-Belegung Warnung (%):
+: <input type="number" name="RAM_WARN" min="1" max="100" value="<?=sm_v($sm,'RAM_WARN')?>" style="width:6em">
+
+USV prüfen (apcupsd):
+: <?=sm_yn($sm,'CHECK_UPS')?>
+
+<div class="srvmon-sec">TLS-Zertifikate<small>Prüfung höchstens einmal pro Stunde</small></div>
+
+Zertifikate prüfen:
+: <?=sm_yn($sm,'CHECK_CERTS')?>
+
+Zertifikatsverzeichnisse (kommagetrennt):
+: <input type="text" name="CERT_DIRS" value="<?=sm_v($sm,'CERT_DIRS')?>" style="width:30em" placeholder="/mnt/user/appdata/NginxProxyManager/letsencrypt/live">
+
+Live zu prüfende Hosts (kommagetrennt):
+: <input type="text" name="CERT_HOSTS" value="<?=sm_v($sm,'CERT_HOSTS')?>" style="width:30em" placeholder="cloud.example.com@192.168.1.10:443">
+
+Ablauf Warnung / Kritisch (Tage vorher):
+: <input type="number" name="CERT_WARN_DAYS" min="1" value="<?=sm_v($sm,'CERT_WARN_DAYS')?>" style="width:6em"> <input type="number" name="CERT_CRIT_DAYS" min="0" value="<?=sm_v($sm,'CERT_CRIT_DAYS')?>" style="width:6em">
+
+Vertrauenskette und Hostname prüfen:
+: <?=sm_yn($sm,'CERT_VERIFY')?>
+
+Ignorierte Domains (kommagetrennt):
+: <input type="text" name="CERT_IGNORE" value="<?=sm_v($sm,'CERT_IGNORE')?>" style="width:30em">
+
+<div class="srvmon-sec">Weitere Benachrichtigungswege<small>zusätzlich zu Unraids Benachrichtigungen</small></div>
+
+Webhook-URL (z. B. Home Assistant):
+: <input type="text" name="WEBHOOK_URL" value="<?=sm_v($sm,'WEBHOOK_URL')?>" style="width:30em" placeholder="http://192.168.1.20:8123/api/webhook/srvmon-...">
+
+Webhook senden für:
+: <?=sm_lvl($sm,'WEBHOOK_LEVEL')?>
+
+Heartbeat-URL (externe Ausfallüberwachung):
+: <input type="text" name="HEARTBEAT_URL" value="<?=sm_v($sm,'HEARTBEAT_URL')?>" style="width:30em" placeholder="https://hc-ping.com/...">
+
+<div class="srvmon-sec"></div>
+
+&nbsp;
+: <input type="submit" value="Übernehmen"><input type="button" value="Fertig" onclick="done()">
+</form>
+]]></INLINE>
+</FILE>
+
+<FILE Name="&emhttp;/SrvmonStatus.page">
+<INLINE><![CDATA[Menu="Utilities"
+Title="Server Monitor Status"
+Icon="heartbeat"
+Markdown="false"
+---
+<style>
+.smd{--ok:#3b8c2a;--warn:#c98a00;--crit:#c0392b;--line:rgba(127,127,127,.25);--soft:rgba(127,127,127,.10);max-width:1400px}
+.smd-head{display:flex;flex-wrap:wrap;gap:.5em 1.5em;align-items:center;margin:0 0 1em}
+.smd-badge{display:inline-block;padding:.15em .6em;border-radius:4px;font-weight:bold;color:#fff}
+.smd-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:1em}
+.smd-card{border:1px solid var(--line);border-radius:6px;padding:.8em 1em;min-width:0}
+.smd-card h3{margin:0 0 .6em;font-size:1.05em}
+.smd-wide{grid-column:1/-1}
+.smd-row{display:flex;justify-content:space-between;gap:1em;margin:.25em 0}
+.smd-bar{height:8px;background:var(--soft);border-radius:4px;overflow:hidden;margin:.2em 0 .6em}
+.smd-bar>span{display:block;height:100%}
+.smd-scroll{overflow-x:auto}
+.smd table{width:100%;border-collapse:collapse}
+.smd th,.smd td{text-align:left;padding:.3em .5em;border-bottom:1px solid var(--line);white-space:nowrap}
+.smd-chip{display:inline-block;padding:.05em .5em;border-radius:3px;font-size:.9em;border:1px solid currentColor}
+.smd-issue{border-left:4px solid;padding:.3em .7em;margin:.4em 0;background:var(--soft)}
+.smd-muted{opacity:.7;font-size:.9em}
+.smd-ok{color:var(--ok)}.smd-warn{color:var(--warn)}.smd-crit{color:var(--crit)}
+</style>
+<div class="smd" id="smd">
+<div class="smd-head"><span id="smd-summary">Lade Daten …</span><span class="smd-muted" id="smd-times"></span><span class="smd-muted">Aktualisierung alle 30 s</span></div>
+<div class="smd-grid" id="smd-grid"></div>
+</div>
+<script>
+(function(){
+  var URL='/plugins/srvmon/include/data.php', REFRESH=30000;
+  function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+  function fmtB(b){if(b==null)return '–';var u=['B','KB','MB','GB','TB','PB'],i=0;b=Number(b);while(b>=1024&&i<u.length-1){b/=1024;i++;}return b.toFixed(1).replace('.',',')+' '+u[i];}
+  function fmtT(ts){if(!ts)return '–';var d=new Date(ts*1000);return d.toLocaleString('de-DE');}
+  function fmtUp(s){var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+' T ':'')+h+' h '+m+' min';}
+  function lvlCls(v,w,c){if(v==null)return '';return v>=c?'smd-crit':(v>=w?'smd-warn':'smd-ok');}
+  function col(cls){return cls==='smd-crit'?'var(--crit)':(cls==='smd-warn'?'var(--warn)':'var(--ok)');}
+  function bar(pct,cls){var p=Math.max(0,Math.min(100,pct||0));return '<div class="smd-bar"><span style="width:'+p+'%;background:'+col(cls)+'"></span></div>';}
+  function card(title,body,wide){return '<div class="smd-card'+(wide?' smd-wide':'')+'"><h3>'+esc(title)+'</h3>'+body+'</div>';}
+  function chip(text,cls){return '<span class="smd-chip '+cls+'">'+esc(text)+'</span>';}
+  function n1(v){return v==null?'–':Number(v).toFixed(1).replace('.',',');}
+  function render(d){
+    var t=d.thresholds, h='';
+    var crit=d.issues.filter(function(i){return i.level==='alert';}).length, warn=d.issues.length-crit;
+    var sum=crit?'<span class="smd-badge" style="background:var(--crit)">'+crit+' kritisch</span> ':'';
+    sum+=warn?'<span class="smd-badge" style="background:var(--warn)">'+warn+' Warnung'+(warn>1?'en':'')+'</span>':'';
+    if(!crit&&!warn)sum='<span class="smd-badge" style="background:var(--ok)">Alles in Ordnung</span>';
+    document.getElementById('smd-summary').innerHTML=sum;
+    document.getElementById('smd-times').textContent='Live-Daten: '+fmtT(d.time)+' · Letzte Prüfung: '+fmtT(d.lastrun);
+    if(d.issues.length){
+      var b='';d.issues.forEach(function(i){var c=i.level==='alert'?'smd-crit':'smd-warn';
+        b+='<div class="smd-issue" style="border-color:'+col(c)+'"><b class="'+c+'">'+esc(i.subject)+'</b><br>'+esc(i.desc)+'<br><span class="smd-muted">seit '+fmtT(i.since)+'</span></div>';});
+      h+=card('Aktive Probleme',b,true);
+    }
+    if(d.system){
+      var s=d.system,b='',lc=lvlCls(s.load_pct,t.cpu,1e9),mc=lvlCls(s.mem_pct,t.ram,1e9);
+      b+='<div class="smd-row"><span>CPU-Last (5 min)</span><span class="'+lc+'">'+n1(s.load_pct)+' %</span></div>'+bar(s.load_pct,lc);
+      b+='<div class="smd-row smd-muted"><span>Load 1 / 5 / 15</span><span>'+s.load.map(function(x){return x==null?'–':x.toFixed(2);}).join(' / ')+' ('+s.cores+' CPUs)</span></div>';
+      b+='<div class="smd-row"><span>RAM</span><span class="'+mc+'">'+n1(s.mem_pct)+' %</span></div>'+bar(s.mem_pct,mc);
+      b+='<div class="smd-row smd-muted"><span>Verfügbar / Gesamt</span><span>'+fmtB(s.mem_avail)+' / '+fmtB(s.mem_total)+'</span></div>';
+      b+='<div class="smd-row"><span>Uptime</span><span>'+fmtUp(s.uptime)+'</span></div>';
+      h+=card('System',b);
+    }
+    if('ups' in d){
+      var b='';
+      if(!d.ups)b='<span class="smd-muted">Keine USV-Daten (apcupsd nicht aktiv).</span>';
+      else{var u=d.ups,uc=/ONBATT|COMMLOST|REPLACEBATT|LOWBATT/i.test(u.status)?'smd-crit':'smd-ok';
+        b+='<div class="smd-row"><span>Status</span><span>'+chip(u.status||'?',uc)+'</span></div>';
+        b+='<div class="smd-row"><span>Ladung</span><span>'+esc(u.charge||'–')+'</span></div>';
+        b+='<div class="smd-row"><span>Restlaufzeit</span><span>'+esc(u.timeleft||'–')+'</span></div>';
+        b+='<div class="smd-row"><span>Last</span><span>'+esc(u.load||'–')+'</span></div>';
+        if(u.model)b+='<div class="smd-row smd-muted"><span>Modell</span><span>'+esc(u.model)+'</span></div>';}
+      h+=card('USV',b);
+    }
+    if(d.space){
+      var b='';
+      if(!d.space.length)b='<span class="smd-muted">Keiner der konfigurierten Pfade ist gemountet.</span>';
+      d.space.forEach(function(p){var c=lvlCls(p.pct,t.space[0],t.space[1]);
+        b+='<div class="smd-row"><span>'+esc(p.path)+'</span><span class="'+c+'">'+n1(p.pct)+' %</span></div>'+bar(p.pct,c);
+        b+='<div class="smd-row smd-muted" style="margin-top:-.5em"><span></span><span>frei '+fmtB(p.free)+' von '+fmtB(p.total)+'</span></div>';});
+      h+=card('Speicherplatz',b);
+    }
+    if('disks' in d){
+      var b;
+      if(!d.disks)b='<span class="smd-muted">disks.ini nicht lesbar.</span>';
+      else{
+        b='<div class="smd-scroll"><table><thead><tr><th>Disk</th><th>Gerät</th><th>Status</th><th>Temp.</th><th>Fehler</th><th>SMART (letzter Stand)</th></tr></thead><tbody>';
+        d.disks.forEach(function(k){
+          var th=k.nvme?t.nvme:t.hdd, tc=k.type==='Flash'?'':lvlCls(k.temp,th[0],th[1]);
+          var temp=k.temp==null?'<span class="smd-muted">'+(k.type==='Flash'?'–':'Standby')+'</span>':'<span class="'+tc+'">'+k.temp+' °C</span>';
+          var sm='<span class="smd-muted">–</span>';
+          if(k.smart){var parts=[],bad=false;
+            Object.keys(k.smart.counters||{}).forEach(function(l){var v=k.smart.counters[l];if(v>0){parts.push(l.replace(/_/g,' ')+': '+v);bad=true;}});
+            if(k.smart.passed===false){parts.unshift('FAILED');bad=true;}
+            if(k.smart.wear!=null)parts.push('Verschleiß '+k.smart.wear+' %');
+            sm=bad?'<span class="smd-crit">'+esc(parts.join(', '))+'</span>':'<span class="smd-ok">OK</span>'+(parts.length?' <span class="smd-muted">'+esc(parts.join(', '))+'</span>':'');}
+          b+='<tr><td>'+esc(k.name)+'</td><td>'+esc(k.device)+'</td><td>'+(k.status==='DISK_OK'?chip('OK','smd-ok'):chip(k.status,'smd-crit'))+'</td><td>'+temp+'</td><td class="'+(k.errors>0?'smd-crit':'')+'">'+k.errors+'</td><td>'+sm+'</td></tr>';});
+        b+='</tbody></table></div>';
+      }
+      h+=card('Disks',b,true);
+    }
+    if('docker' in d){
+      var b;
+      if(!d.docker)b='<span class="smd-muted">Docker-Dienst nicht erreichbar.</span>';
+      else{var all=d.docker_watch.indexOf('*')>=0,run=d.docker.filter(function(c){return c.state==='running';}).length,upd=d.docker.filter(function(c){return c.update_available;}).length;
+        b='<div class="smd-row smd-muted"><span>'+run+' von '+d.docker.length+' laufen'+(upd?' · <span class="smd-warn">'+upd+' Update(s)</span>':'')+'</span><span>'+(all?'Alle überwacht':'Überwacht: '+esc(d.docker_watch.join(', ')||'keine'))+'</span></div>';
+        b+='<div class="smd-scroll"><table><tbody>';
+        d.docker.forEach(function(c){var w=all||d.docker_watch.indexOf(c.name)>=0,ok=c.state==='running';
+          var cls=c.unhealthy?'smd-warn':(ok?'smd-ok':(w?'smd-crit':''));
+          var info=(c.version?'v '+esc(c.version):'')+(c.updated?(c.version?' · ':'')+'aktualisiert '+fmtT(c.updated):'');
+          b+='<tr><td>'+esc(c.name)+(w&&!all?' <span class="smd-muted">(überwacht)</span>':'')+'</td><td>'+chip(c.unhealthy?'unhealthy':c.state,cls)+(c.update_available?' '+chip('Update','smd-warn'):'')+'</td><td class="smd-muted">'+esc(c.status)+(info?'<br>'+info:'')+'</td></tr>';});
+        b+='</tbody></table></div>';}
+      h+=card('Docker',b);
+    }
+    if('vms' in d){
+      var b;
+      if(!d.vms)b='<span class="smd-muted">VM-Dienst nicht erreichbar.</span>';
+      else if(!d.vms.length)b='<span class="smd-muted">Keine VMs angelegt.</span>';
+      else{var all=d.vm_watch.indexOf('*')>=0;b='<table><tbody>';
+        d.vms.forEach(function(v){var w=all||d.vm_watch.indexOf(v.name)>=0,ok=v.state==='running';
+          var cls=v.state==='crashed'?'smd-crit':(ok?'smd-ok':(w?'smd-crit':''));
+          b+='<tr><td>'+esc(v.name)+(w&&!all?' <span class="smd-muted">(überwacht)</span>':'')+'</td><td>'+chip(v.state||'?',cls)+'</td></tr>';});
+        b+='</tbody></table>';}
+      h+=card('VMs',b);
+    }
+    if('updates' in d){
+      var b;
+      if(!d.updates)b='<span class="smd-muted">Keine Update-Informationen von Unraid vorhanden.</span>';
+      else if(!d.updates.length)b='<span class="smd-ok">Alle Images aktuell.</span>';
+      else{b='<div class="smd-row"><span class="smd-warn">'+d.updates.length+' Update(s) verfügbar</span></div><ul style="margin:.3em 0 0 1.2em;padding:0">';
+        d.updates.forEach(function(u){b+='<li>'+esc(u)+'</li>';});b+='</ul>';}
+      h+=card('Docker-Updates',b);
+    }
+    if('certs' in d){
+      var b;
+      if(!d.certs)b='<span class="smd-muted">Noch keine Zertifikatsprüfung gelaufen.</span>';
+      else if(!d.certs.items.length)b='<span class="smd-muted">Keine Zertifikate gefunden. Verzeichnisse und Hosts in den Einstellungen prüfen.</span>';
+      else{var ct=t.cert||[20,7];b='<div class="smd-scroll"><table><thead><tr><th>Name</th><th>Quelle</th><th>Gültig bis</th><th>Rest</th><th>Hinweis</th></tr></thead><tbody>';
+        d.certs.items.forEach(function(c){
+          var cls=(c.days==null||c.superseded)?'smd-muted':(c.days<=ct[1]?'smd-crit':(c.days<=ct[0]?'smd-warn':'smd-ok'));
+          var note=c.error?'<span class="smd-crit">'+esc(c.error)+'</span>':[c.verify?'<span class="smd-warn">'+esc(c.verify)+'</span>':'',c.stale?'<span class="smd-warn">älter als Datei</span>':'',c.superseded?'<span class="smd-muted">ersetzt durch '+esc(c.superseded)+', wird ignoriert</span>':'',c.issuer?'<span class="smd-muted">'+esc(c.issuer)+'</span>':''].filter(Boolean).join(' · ');
+          b+='<tr><td>'+esc(c.name)+(c.names&&c.names.length>1?' <span class="smd-muted">+'+(c.names.length-1)+'</span>':'')+'</td><td>'+esc(c.source)+'</td><td>'+(c.expires?new Date(c.expires*1000).toLocaleDateString('de-DE'):'–')+'</td><td class="'+cls+'">'+(c.days==null?'–':c.days+' T')+'</td><td>'+note+'</td></tr>';});
+        b+='</tbody></table></div><div class="smd-muted" style="margin-top:.4em">Geprüft: '+fmtT(d.certs.time)+'</div>';}
+      h+=card('TLS-Zertifikate',b,true);
+    }
+    document.getElementById('smd-grid').innerHTML=h;
+  }
+  function load(){
+    fetch(URL,{cache:'no-store',credentials:'same-origin'})
+      .then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();})
+      .then(render)
+      .catch(function(e){document.getElementById('smd-summary').innerHTML='<span class="smd-crit">Daten konnten nicht geladen werden ('+esc(e.message)+').</span>';});
+  }
+  load();
+  setInterval(function(){if(!document.hidden)load();},REFRESH);
+})();
+</script>
+]]></INLINE>
+</FILE>
+
+<FILE Run="/bin/bash">
+<INLINE>
+mkdir -p &plgpath;
+chmod 0755 &emhttp;/scripts/check.php
+# Cron: jede Minute aufrufen, das Intervall prueft das Skript selbst
+cat > &plgpath;/&name;.cron &lt;&lt;'EOF'
+# srvmon
+* * * * * /usr/bin/php &emhttp;/scripts/check.php &gt;/dev/null 2&gt;&amp;1
+EOF
+/usr/local/sbin/update_cron
+# update_cron beruecksichtigt nur bereits registrierte Plugins. Waehrend dieses Skripts ist srvmon
+# noch nicht registriert, daher nach Abschluss der Installation erneut einlesen.
+nohup bash -c 'sleep 15; /usr/local/sbin/update_cron' &gt;/dev/null 2&gt;&amp;1 &amp;
+echo "srvmon &version; installiert. Seiten: Settings > User Utilities > Server Monitor / Server Monitor Status"
+</INLINE>
+</FILE>
+
+<FILE Run="/bin/bash" Method="remove">
+<INLINE>
+rm -f &plgpath;/&name;.cron
+/usr/local/sbin/update_cron
+rm -rf &emhttp; /tmp/&name;
+echo "srvmon entfernt. Konfiguration und Zustand bleiben in &plgpath; erhalten."
+</INLINE>
+</FILE>
+
+</PLUGIN>
