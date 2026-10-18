@@ -2,9 +2,9 @@
 
 srvmon monitors the health of an Unraid server and reports relevant events through Unraid's own notification system (email, push services) and optionally via webhook, for example to Home Assistant for Alexa announcements. It also provides a live status page in the WebGUI.
 
-Version: 2026.10.18m
+Version: 2026.10.18n
 Repository: https://github.com/MarioKonang/unraid-srvmon
-Target platform: Unraid 6.12 and newer (used on 7.2.3, see [Verification status](#verification-status))
+Target platform: Unraid 6.12 and newer (used on 7.2.4, see [Verification status](#verification-status))
 
 ---
 
@@ -134,6 +134,7 @@ Not reported as an update:
 |---|---|---|
 | Unraid OS update | Unraid's OS update check reports a newer version that is not ignored (once per new version) | normal |
 | Plugin update | Unraid's plugin check downloaded a newer `.plg` for an installed plugin (once per new version, all plugins of a run in one notification) | normal |
+| Plugin updated | the installed version of a plugin changed since the last run (one-off event, old and new version, all plugins of a run in one notification) | normal |
 
 **Source:** as with Docker, srvmon does not contact the release server or plugin repositories itself. It reads the results of Unraid's own checks:
 
@@ -142,9 +143,11 @@ Not reported as an update:
 
 Both results live in RAM and are empty after a reboot until Unraid's next check. In that case srvmon reports nothing and keeps its last state, so known updates are not reported again.
 
+**Performed plugin updates:** srvmon remembers the version of every installed plugin (`/var/log/plugins/*.plg`, without the Unraid OS itself). When the version changes, it reports the update with old and new version. This works regardless of how the update was installed: via the *Plugins* tab, the command line, or an update applied during boot. Newly installed plugins are not reported, as there is no previous version. A plugin that is missing in a run, e.g. because it is still being installed during boot, loses its stored version; this avoids false reports, but an update in exactly that moment is not reported. srvmon reports its own updates as well, starting with the update after 2026.10.18n.
+
 **Schedule:** how current the information is depends on Unraid's checks. Enable them under *Settings > Notifications* (*Unraid OS update check* and *Plugins update check*). Opening *Tools > Update OS* or clicking *Check for updates* in the *Plugins* tab also refreshes the results.
 
-**Duplicate notifications:** Unraid's scheduled checks send their own notification as well, so an update usually appears twice. What srvmon adds is the webhook (e.g. Alexa) and the overview on the status page. If the duplicates bother you, set `CHECK_OS_UPDATES` or `CHECK_PLUGIN_UPDATES` to `no`; the status page card then disappears as well.
+**Duplicate notifications:** Unraid's scheduled checks send their own notification as well, so an update usually appears twice. What srvmon adds is the webhook (e.g. Alexa) and the overview on the status page. If the duplicates bother you, set `CHECK_OS_UPDATES` or `CHECK_PLUGIN_UPDATES` to `no`; the corresponding part of the status page card then disappears as well. Unraid has no notification for performed plugin updates, so `CHECK_PLUGIN_UPDATED` causes no duplicates.
 
 ### TLS certificates (Nginx Proxy Manager)
 
@@ -213,6 +216,15 @@ There are two kinds of notifications.
 
 The subject has the form `srvmon: <summary>`; the sender is shown in Unraid as "Server Monitor".
 
+### Language
+
+Notifications can be sent in English, German, French or Spanish. The language is set separately for Unraid's notifications (`NOTIFY_LANG`) and for the webhook (`WEBHOOK_LANG`), e.g. English emails and German Alexa announcements.
+
+- Translated: subject, description and the `speech` field of the webhook, including "Still active" reminders and "Resolved" notifications.
+- Not translated: values that come from other programs, e.g. the Docker status ("Exited (1) 5 minutes ago"), apcupsd values ("80.0 Percent"), OpenSSL error messages and disk states such as `DISK_DSBL`. Numbers keep the decimal point.
+- Always English: the syslog, the settings page and the status page.
+- If a text has no translation, it is sent in English. Translations are stored in `include/lang.php`.
+
 ---
 
 ## Additional notification channels
@@ -229,12 +241,13 @@ If `WEBHOOK_URL` is set, srvmon additionally sends every notification from level
   "subject": "Certificate cloud.example.com expires in 9 days",
   "description": "Certificate for cloud.example.com (npm-2, ...) valid until ...",
   "speech": "Warning from server unraid: Certificate cloud.example.com expires in 9 days",
+  "lang": "en",
   "host": "unraid",
   "time": 1792330214
 }
 ```
 
-The `speech` field is meant for voice output: short, with level and server name, without the long description.
+The `speech` field is meant for voice output: short, with level and server name, without the long description. `subject`, `description` and `speech` are in the language set in `WEBHOOK_LANG` (see [Language](#language)); `lang` contains its code (`en`, `de`, `fr` or `es`).
 
 Rules:
 
@@ -345,7 +358,7 @@ The page is located under *Settings > User Utilities > Server Monitor Status*. I
 - disks as a table with status, temperature, errors and SMART values,
 - Docker and VMs with their state, watched entries are marked; for containers additionally an "Update" hint, the image version and the time of the last detected update,
 - available Docker updates,
-- Unraid OS and plugin updates: installed OS version, available OS version, plugins with installed and available version, time of Unraid's last check,
+- Unraid OS and plugin updates: installed OS version, available OS version, plugins with installed and available version, time of Unraid's last check, plugins updated in the last 7 days,
 - TLS certificates with source (file or live), expiry date, days left, issuer and notes. These come from the last hourly check; the time is shown below the table.
 
 The page reloads its data every 30 seconds while the browser tab is visible. Colours follow the configured thresholds.
@@ -447,6 +460,7 @@ Changes to the file take effect on the next run; no restart is needed.
 | `INTERVAL` | `5` | check interval in minutes (1 to 1440) |
 | `REMIND_HOURS` | `24` | reminder for ongoing problems after x hours, `0` = off |
 | `NOTIFY_RESOLVED` | `yes` | notify when a problem is resolved |
+| `NOTIFY_LANG` | `en` | language of Unraid's notifications: `en`, `de`, `fr` or `es` (see [Language](#language)) |
 
 ### Enabling and disabling checks
 
@@ -463,6 +477,7 @@ Changes to the file take effect on the next run; no restart is needed.
 | `CHECK_DOCKER_UPDATED` | `yes` | notify about performed container updates (only together with `CHECK_DOCKER`) |
 | `CHECK_OS_UPDATES` | `yes` | notify about available Unraid OS updates |
 | `CHECK_PLUGIN_UPDATES` | `yes` | notify about available plugin updates |
+| `CHECK_PLUGIN_UPDATED` | `yes` | notify about performed plugin updates |
 
 ### TLS certificates
 
@@ -482,6 +497,7 @@ Changes to the file take effect on the next run; no restart is needed.
 |---|---|---|
 | `WEBHOOK_URL` | empty | target for webhook calls (HTTP POST with JSON); empty = off |
 | `WEBHOOK_LEVEL` | `warning` | minimum level for webhooks: `normal` (everything), `warning` (warnings and alerts) or `alert` |
+| `WEBHOOK_LANG` | `en` | language of the webhook texts: `en`, `de`, `fr` or `es` |
 | `HEARTBEAT_URL` | empty | called via GET on every check run; empty = off |
 
 ### Thresholds
@@ -537,6 +553,7 @@ RAM_WARN="95"
 REMIND_HOURS="12"
 CERT_HOSTS="cloud.example.com@192.168.1.10,app.example.com@192.168.1.10"
 CERT_IGNORE="old.example.com"
+WEBHOOK_LANG="de"
 ```
 
 ---
@@ -551,7 +568,7 @@ php /usr/local/emhttp/plugins/srvmon/scripts/check.php [options]
 |---|---|
 | none | normal run; skipped if the interval has not elapsed yet |
 | `--force` | ignore the interval (and the hourly certificate limit) and check immediately |
-| `--dry-run` | print notifications to the console only; send nothing, save no state |
+| `--dry-run` | print notifications to the console only; send nothing, save no state. If a language other than English is set, the translated Unraid notification and webhook announcement are printed below each line |
 | `--test` | send a test notification (also to the webhook) |
 
 Note: `--dry-run` only shows what would be sent **in this run**. Problems already stored in the state are not repeated. The status page shows the complete current state.
@@ -569,6 +586,7 @@ The cron job calls the script every minute; the script checks the interval itsel
 | `/usr/local/emhttp/plugins/srvmon/README.md` | short description for the plugin list |
 | `/usr/local/emhttp/plugins/srvmon/default.cfg` | default values |
 | `/usr/local/emhttp/plugins/srvmon/include/lib.php` | shared functions and data collectors |
+| `/usr/local/emhttp/plugins/srvmon/include/lang.php` | translations of the notification texts |
 | `/usr/local/emhttp/plugins/srvmon/include/data.php` | JSON endpoint for the status page |
 | `/usr/local/emhttp/plugins/srvmon/scripts/check.php` | check script |
 | `/usr/local/emhttp/plugins/srvmon/srvmon.page` | settings page |
@@ -581,7 +599,7 @@ The cron job calls the script every minute; the script checks the interval itsel
 | `/boot/config/plugins/srvmon.plg` | plugin definition, installed by Unraid on boot |
 | `/boot/config/plugins/srvmon/srvmon.cfg` | your settings |
 | `/boot/config/plugins/srvmon/srvmon.cron` | cron entry |
-| `/boot/config/plugins/srvmon/state.json` | active problems, SMART baseline, last known container and VM states, image ID and version per container, known Docker, OS and plugin updates |
+| `/boot/config/plugins/srvmon/state.json` | active problems, SMART baseline, last known container and VM states, image ID and version per container, known Docker, OS and plugin updates, installed plugin versions with time of the last update |
 
 `state.json` is only written when its content actually changes, to spare the flash drive.
 
@@ -612,6 +630,7 @@ The cron job calls the script every minute; the script checks the interval itsel
 | Docker updates | `/var/lib/docker/unraid-update-status.json` |
 | Unraid OS updates | `/tmp/unraidcheck/result.json`, `/tmp/unraidcheck/ignored.json`, `/etc/unraid-version` |
 | Plugin updates | `/tmp/plugins/*.plg` compared with `/var/log/plugins/*.plg` |
+| Performed plugin updates | `version` attribute of `/var/log/plugins/*.plg` |
 | Certificate files | `openssl x509` on `<CERT_DIRS>/*/fullchain.pem` |
 | Served certificates | `openssl s_client` with SNI and `-verify_hostname` |
 | Delivery | `/usr/local/emhttp/webGui/scripts/notify`, `curl` for webhook and heartbeat |
@@ -654,9 +673,9 @@ All external calls run with `timeout`, so a hanging service does not block the r
 
 ## Verification status
 
-srvmon was developed and tested with simulated Unraid files and tools and has since been used on Unraid 7.2.3.
+srvmon was developed and tested with simulated Unraid files and tools and has since been used on Unraid 7.2.3 and 7.2.4.
 
-**Confirmed on Unraid 7.2.3:**
+**Confirmed on Unraid 7.2.3 and 7.2.4:**
 
 - installation via `plugin install`, plugin list entry
 - cron entry via `update_cron` (fix for the missing entry after installation is included since 2026.10.18e)
@@ -667,6 +686,7 @@ srvmon was developed and tested with simulated Unraid files and tools and has si
 - live check with `openssl s_client`, including trust verification with the system's CA certificates
 - webhook to Home Assistant and Alexa announcement
 - format of the OS update check result `/tmp/unraidcheck/result.json` (fields `isNewer`, `version`, `isEligible`, `params.update_exp`) and the downloaded `.plg` files in `/tmp/plugins/` (checked on 7.2.4)
+- update via the *Plugins* tab replaces the program files (since 2026.10.18m)
 
 **Not yet confirmed:**
 
@@ -700,6 +720,12 @@ srvmon was developed and tested with simulated Unraid files and tools and has si
 ---
 
 ## Changelog
+
+### 2026.10.18n
+- Notification when a plugin was updated (installed version changed), with old and new version; all plugins of a run in one notification
+- Status page: plugins updated in the last 7 days
+- New option `CHECK_PLUGIN_UPDATED`
+- Language of the notifications selectable: English, German, French or Spanish, separately for Unraid's notifications (`NOTIFY_LANG`) and the webhook (`WEBHOOK_LANG`); the webhook payload contains the new field `lang`
 
 ### 2026.10.18m
 - Fix: updates via the Plugins tab did not replace the program files, because Unraid does not overwrite existing files. The previous version kept running although the new version was shown. The installation now removes the old program files first; configuration and state are kept.

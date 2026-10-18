@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "srvmon">
 <!ENTITY author    "MarioKonang">
-<!ENTITY version   "2026.10.18m">
+<!ENTITY version   "2026.10.18n">
 <!ENTITY repo      "https://github.com/MarioKonang/unraid-srvmon">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/MarioKonang/unraid-srvmon/main/srvmon.plg">
 <!ENTITY emhttp    "/usr/local/emhttp/plugins/&name;">
@@ -11,6 +11,12 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" pluginURL="&pluginURL;" min="6.12.0" icon="heartbeat" launch="Settings/srvmon" support="&repo;">
 
 <CHANGES>
+###2026.10.18n
+- Notification when a plugin was updated (installed version changed), all plugins of a run in one notification
+- Status page: plugins updated in the last 7 days
+- New option CHECK_PLUGIN_UPDATED
+- Language of the notifications selectable (English, German, French, Spanish), separately for Unraid notifications and webhook
+
 ###2026.10.18m
 - Fix: updates via the Plugins tab did not replace the program files, so the previous version kept running. Old program files are now removed before installation.
 - Unraid OS update: hint if the update period of the license has ended (isEligible), also on the status page
@@ -96,6 +102,7 @@ CHECK_UPDATES="yes"
 CHECK_DOCKER_UPDATED="yes"
 CHECK_OS_UPDATES="yes"
 CHECK_PLUGIN_UPDATES="yes"
+CHECK_PLUGIN_UPDATED="yes"
 TEMP_HDD_WARN="45"
 TEMP_HDD_CRIT="50"
 TEMP_NVME_WARN="60"
@@ -109,6 +116,7 @@ CPU_LOAD_WARN="90"
 RAM_WARN="90"
 REMIND_HOURS="24"
 NOTIFY_RESOLVED="yes"
+NOTIFY_LANG="en"
 CHECK_CERTS="yes"
 CERT_DIRS="/mnt/user/appdata/NginxProxyManager/letsencrypt/live"
 CERT_HOSTS=""
@@ -118,6 +126,7 @@ CERT_VERIFY="yes"
 CERT_IGNORE=""
 WEBHOOK_URL=""
 WEBHOOK_LEVEL="warning"
+WEBHOOK_LANG="en"
 HEARTBEAT_URL=""
 ]]></INLINE>
 </FILE>
@@ -437,6 +446,21 @@ function sm_plg_attr(string $file, string $attr): string
     return $xml === false ? '' : (string)($xml->attributes()[$attr] ?? '');
 }
 
+/** Installed plugins with version, without the OS itself. null = plugin directory not readable. */
+function sm_get_plugins(): ?array
+{
+    if (!is_dir(SM_PLG_LOCAL)) return null;
+    $r = [];
+    foreach (glob(SM_PLG_LOCAL . '/*.plg') ?: [] as $f) {
+        $name = basename($f, '.plg');
+        if (in_array($name, ['unRAIDServer', 'unRAIDServer-'], true)) continue;
+        $v = sm_plg_attr($f, 'version');
+        if ($v !== '') $r[$name] = $v;
+    }
+    ksort($r, SORT_NATURAL | SORT_FLAG_CASE);
+    return $r;
+}
+
 /**
  * Compares the .plg files downloaded by Unraid's plugin check with the installed ones.
  * Same rules as Unraid: string comparison of the version, min/max OS version must fit.
@@ -573,6 +597,375 @@ function sm_cert_covers(array $names, string $host): bool
 ]]></INLINE>
 </FILE>
 
+<FILE Name="&emhttp;/include/lang.php">
+<INLINE><![CDATA[<?php
+/*
+ * srvmon - translations for notifications (Unraid and webhook).
+ *
+ * Checks produce English texts. sm_tr() matches such a text against the English templates below
+ * and returns the translation with the values filled in. Placeholders: {name} is copied as is,
+ * {@name} is translated recursively (for nested texts such as "Still active: <subject>").
+ * Texts without a matching template stay English. When changing a text in check.php,
+ * change its template here as well.
+ */
+declare(strict_types=1);
+
+const SM_LANGS = ['en' => 'English', 'de' => 'Deutsch', 'fr' => 'Français', 'es' => 'Español'];
+
+const SM_TEXTS = [
+    // ---- general
+    "Test notification" => [
+        'de' => "Testbenachrichtigung", 'fr' => "Notification de test", 'es' => "Notificación de prueba"],
+    "srvmon is active. If you receive this message, delivery is set up correctly." => [
+        'de' => "srvmon ist aktiv. Wenn diese Nachricht ankommt, ist die Zustellung richtig eingerichtet.",
+        'fr' => "srvmon est actif. Si vous recevez ce message, la distribution est correctement configurée.",
+        'es' => "srvmon está activo. Si recibe este mensaje, la entrega está configurada correctamente."],
+    "Still active: {@s}" => [
+        'de' => "Weiterhin aktiv: {@s}", 'fr' => "Toujours actif : {@s}", 'es' => "Sigue activo: {@s}"],
+    "{@d} (since {date})" => [
+        'de' => "{@d} (seit {date})", 'fr' => "{@d} (depuis {date})", 'es' => "{@d} (desde {date})"],
+    "Resolved: {@s}" => [
+        'de' => "Behoben: {@s}", 'fr' => "Résolu : {@s}", 'es' => "Resuelto: {@s}"],
+    "The condition is back to normal." => [
+        'de' => "Der Zustand ist wieder normal.", 'fr' => "La situation est revenue à la normale.",
+        'es' => "La situación ha vuelto a la normalidad."],
+    "Further notifications suppressed" => [
+        'de' => "Weitere Benachrichtigungen unterdrückt", 'fr' => "Autres notifications supprimées",
+        'es' => "Otras notificaciones suprimidas"],
+    "{n} more notifications in this run. Details in the syslog (tag srvmon)." => [
+        'de' => "{n} weitere Benachrichtigungen in diesem Lauf. Details im Syslog (Tag srvmon).",
+        'fr' => "{n} autres notifications lors de cette exécution. Détails dans le syslog (tag srvmon).",
+        'es' => "{n} notificaciones más en esta ejecución. Detalles en el syslog (etiqueta srvmon)."],
+
+    // ---- webhook
+    "Alert from server {host}: {@s}" => [
+        'de' => "Alarm von Server {host}: {@s}", 'fr' => "Alerte du serveur {host} : {@s}",
+        'es' => "Alerta del servidor {host}: {@s}"],
+    "Warning from server {host}: {@s}" => [
+        'de' => "Warnung von Server {host}: {@s}", 'fr' => "Avertissement du serveur {host} : {@s}",
+        'es' => "Aviso del servidor {host}: {@s}"],
+    "Notice from server {host}: {@s}" => [
+        'de' => "Hinweis von Server {host}: {@s}", 'fr' => "Information du serveur {host} : {@s}",
+        'es' => "Notificación del servidor {host}: {@s}"],
+    "{n} more notifications" => [
+        'de' => "{n} weitere Benachrichtigungen", 'fr' => "{n} autres notifications", 'es' => "{n} notificaciones más"],
+    "Details in the Unraid notifications." => [
+        'de' => "Details in den Unraid-Benachrichtigungen.", 'fr' => "Détails dans les notifications Unraid.",
+        'es' => "Detalles en las notificaciones de Unraid."],
+    "Server {host} has {n} more notifications. Details in Unraid." => [
+        'de' => "Server {host} hat {n} weitere Benachrichtigungen. Details in Unraid.",
+        'fr' => "Le serveur {host} a {n} autres notifications. Détails dans Unraid.",
+        'es' => "El servidor {host} tiene {n} notificaciones más. Detalles en Unraid."],
+
+    // ---- disks
+    "Disk {name}: Status {status}" => [
+        'de' => "Datenträger {name}: Status {status}", 'fr' => "Disque {name} : état {status}",
+        'es' => "Disco {name}: estado {status}"],
+    "Disk {name} ({dev}) reports status {status}." => [
+        'de' => "Datenträger {name} ({dev}) meldet Status {status}.",
+        'fr' => "Le disque {name} ({dev}) signale l'état {status}.",
+        'es' => "El disco {name} ({dev}) informa del estado {status}."],
+    "Disk {name} (no device detected) reports status {status}." => [
+        'de' => "Datenträger {name} (kein Gerät erkannt) meldet Status {status}.",
+        'fr' => "Le disque {name} (aucun périphérique détecté) signale l'état {status}.",
+        'es' => "El disco {name} (ningún dispositivo detectado) informa del estado {status}."],
+    "Disk {name}: I/O errors" => [
+        'de' => "Datenträger {name}: E/A-Fehler", 'fr' => "Disque {name} : erreurs d'E/S",
+        'es' => "Disco {name}: errores de E/S"],
+    "Unraid counts {n} read/write errors on disk {name} ({dev})." => [
+        'de' => "Unraid zählt {n} Lese-/Schreibfehler auf Datenträger {name} ({dev}).",
+        'fr' => "Unraid compte {n} erreurs de lecture/écriture sur le disque {name} ({dev}).",
+        'es' => "Unraid cuenta {n} errores de lectura/escritura en el disco {name} ({dev})."],
+    "Disk {name}: temperature critical" => [
+        'de' => "Datenträger {name}: Temperatur kritisch", 'fr' => "Disque {name} : température critique",
+        'es' => "Disco {name}: temperatura crítica"],
+    "Disk {name}: temperature high" => [
+        'de' => "Datenträger {name}: Temperatur hoch", 'fr' => "Disque {name} : température élevée",
+        'es' => "Disco {name}: temperatura alta"],
+    "Disk {name} ({dev}) is at {t} °C (critical from {c} °C)." => [
+        'de' => "Datenträger {name} ({dev}) hat {t} °C (kritisch ab {c} °C).",
+        'fr' => "Le disque {name} ({dev}) est à {t} °C (critique à partir de {c} °C).",
+        'es' => "El disco {name} ({dev}) está a {t} °C (crítico desde {c} °C)."],
+    "Disk {name} ({dev}) is at {t} °C (warning from {w} °C)." => [
+        'de' => "Datenträger {name} ({dev}) hat {t} °C (Warnung ab {w} °C).",
+        'fr' => "Le disque {name} ({dev}) est à {t} °C (avertissement à partir de {w} °C).",
+        'es' => "El disco {name} ({dev}) está a {t} °C (aviso desde {w} °C)."],
+
+    // ---- SMART
+    "Disk {name}: SMART status FAILED" => [
+        'de' => "Datenträger {name}: SMART-Status FEHLGESCHLAGEN", 'fr' => "Disque {name} : état SMART EN ÉCHEC",
+        'es' => "Disco {name}: estado SMART FALLIDO"],
+    "The overall SMART status of disk {name} ({dev}) is FAILED. Replace the disk soon." => [
+        'de' => "Der SMART-Gesamtstatus von Datenträger {name} ({dev}) ist FAILED. Den Datenträger bald ersetzen.",
+        'fr' => "L'état SMART global du disque {name} ({dev}) est FAILED. Remplacez le disque rapidement.",
+        'es' => "El estado SMART general del disco {name} ({dev}) es FAILED. Sustituya el disco pronto."],
+    "Disk {name}: NVMe Critical Warning" => [
+        'de' => "Datenträger {name}: kritische NVMe-Warnung", 'fr' => "Disque {name} : avertissement critique NVMe",
+        'es' => "Disco {name}: aviso crítico NVMe"],
+    "Disk {name} ({dev}) reports critical_warning = {v}." => [
+        'de' => "Datenträger {name} ({dev}) meldet critical_warning = {v}.",
+        'fr' => "Le disque {name} ({dev}) signale critical_warning = {v}.",
+        'es' => "El disco {name} ({dev}) informa critical_warning = {v}."],
+    "Disk {name}: wear {w} %" => [
+        'de' => "Datenträger {name}: Verschleiß {w} %", 'fr' => "Disque {name} : usure {w} %",
+        'es' => "Disco {name}: desgaste {w} %"],
+    "According to SMART, disk {name} ({dev}) has used {w} % of its rated lifetime." => [
+        'de' => "Laut SMART hat Datenträger {name} ({dev}) {w} % seiner vorgesehenen Lebensdauer verbraucht.",
+        'fr' => "Selon SMART, le disque {name} ({dev}) a utilisé {w} % de sa durée de vie nominale.",
+        'es' => "Según SMART, el disco {name} ({dev}) ha consumido el {w} % de su vida útil nominal."],
+    "Disk {name}: {label} increased" => [
+        'de' => "Datenträger {name}: {label} gestiegen", 'fr' => "Disque {name} : {label} en hausse",
+        'es' => "Disco {name}: {label} ha aumentado"],
+    "Disk {name} ({dev}): {label} increased from {old} to {new}." => [
+        'de' => "Datenträger {name} ({dev}): {label} von {old} auf {new} gestiegen.",
+        'fr' => "Disque {name} ({dev}) : {label} est passé de {old} à {new}.",
+        'es' => "Disco {name} ({dev}): {label} ha aumentado de {old} a {new}."],
+
+    // ---- storage space
+    "Storage almost full: {p}" => [
+        'de' => "Speicher fast voll: {p}", 'fr' => "Stockage presque plein : {p}", 'es' => "Almacenamiento casi lleno: {p}"],
+    "Storage running low: {p}" => [
+        'de' => "Speicherplatz wird knapp: {p}", 'fr' => "Espace de stockage faible : {p}",
+        'es' => "Poco espacio de almacenamiento: {p}"],
+    "{p} is {pct} % full (free: {free})." => [
+        'de' => "{p} ist zu {pct} % belegt (frei: {free}).", 'fr' => "{p} est plein à {pct} % (libre : {free}).",
+        'es' => "{p} está lleno al {pct} % (libre: {free})."],
+
+    // ---- Docker
+    "Container {n}: unhealthy" => [
+        'de' => "Container {n}: fehlerhaft (unhealthy)", 'fr' => "Conteneur {n} : défaillant (unhealthy)",
+        'es' => "Contenedor {n}: no saludable (unhealthy)"],
+    "The health check of container {n} is failing ({status})." => [
+        'de' => "Der Health-Check von Container {n} schlägt fehl ({status}).",
+        'fr' => "Le contrôle de santé du conteneur {n} échoue ({status}).",
+        'es' => "La comprobación de estado del contenedor {n} falla ({status})."],
+    "Container {n} is not running" => [
+        'de' => "Container {n} läuft nicht", 'fr' => "Le conteneur {n} n'est pas en cours d'exécution",
+        'es' => "El contenedor {n} no se está ejecutando"],
+    "Watched container {n} is in state '{st}' ({status})." => [
+        'de' => "Überwachter Container {n} hat den Zustand '{st}' ({status}).",
+        'fr' => "Le conteneur surveillé {n} est dans l'état '{st}' ({status}).",
+        'es' => "El contenedor vigilado {n} está en estado '{st}' ({status})."],
+    "Container {n} stopped" => [
+        'de' => "Container {n} gestoppt", 'fr' => "Conteneur {n} arrêté", 'es' => "Contenedor {n} detenido"],
+    "Container {n}: {status}" => [
+        'de' => "Container {n}: {status}", 'fr' => "Conteneur {n} : {status}", 'es' => "Contenedor {n}: {status}"],
+    "Container {n} not found" => [
+        'de' => "Container {n} nicht gefunden", 'fr' => "Conteneur {n} introuvable", 'es' => "Contenedor {n} no encontrado"],
+    "The watched container {n} does not exist (check the name in the settings)." => [
+        'de' => "Der überwachte Container {n} existiert nicht (Namen in den Einstellungen prüfen).",
+        'fr' => "Le conteneur surveillé {n} n'existe pas (vérifiez le nom dans les paramètres).",
+        'es' => "El contenedor vigilado {n} no existe (compruebe el nombre en la configuración)."],
+    "Container {n}: image changed" => [
+        'de' => "Container {n}: Image geändert", 'fr' => "Conteneur {n} : image modifiée",
+        'es' => "Contenedor {n}: imagen cambiada"],
+    "Container {n} now uses {new} instead of {old}." => [
+        'de' => "Container {n} verwendet jetzt {new} statt {old}.",
+        'fr' => "Le conteneur {n} utilise maintenant {new} au lieu de {old}.",
+        'es' => "El contenedor {n} usa ahora {new} en lugar de {old}."],
+    "Container {n} updated" => [
+        'de' => "Container {n} aktualisiert", 'fr' => "Conteneur {n} mis à jour", 'es' => "Contenedor {n} actualizado"],
+    "Container {n} was started with a new image ({img})." => [
+        'de' => "Container {n} wurde mit einem neuen Image gestartet ({img}).",
+        'fr' => "Le conteneur {n} a été démarré avec une nouvelle image ({img}).",
+        'es' => "El contenedor {n} se inició con una imagen nueva ({img})."],
+    "Container {n} was started with a new image ({img}). Version: {a} -> {b}." => [
+        'de' => "Container {n} wurde mit einem neuen Image gestartet ({img}). Version: {a} -> {b}.",
+        'fr' => "Le conteneur {n} a été démarré avec une nouvelle image ({img}). Version : {a} -> {b}.",
+        'es' => "El contenedor {n} se inició con una imagen nueva ({img}). Versión: {a} -> {b}."],
+
+    // ---- VMs
+    "VM {vm} crashed" => [
+        'de' => "VM {vm} abgestürzt", 'fr' => "VM {vm} plantée", 'es' => "La VM {vm} ha fallado"],
+    "VM {vm} is in state 'crashed'." => [
+        'de' => "VM {vm} hat den Zustand 'crashed'.", 'fr' => "La VM {vm} est dans l'état 'crashed'.",
+        'es' => "La VM {vm} está en estado 'crashed'."],
+    "VM {vm} is not running" => [
+        'de' => "VM {vm} läuft nicht", 'fr' => "La VM {vm} n'est pas en cours d'exécution",
+        'es' => "La VM {vm} no se está ejecutando"],
+    "Watched VM {vm} is in state '{st}'." => [
+        'de' => "Überwachte VM {vm} hat den Zustand '{st}'.", 'fr' => "La VM surveillée {vm} est dans l'état '{st}'.",
+        'es' => "La VM vigilada {vm} está en estado '{st}'."],
+    "VM {vm} stopped" => [
+        'de' => "VM {vm} gestoppt", 'fr' => "VM {vm} arrêtée", 'es' => "VM {vm} detenida"],
+    "VM {vm} is now in state '{st}'." => [
+        'de' => "VM {vm} hat jetzt den Zustand '{st}'.", 'fr' => "La VM {vm} est maintenant dans l'état '{st}'.",
+        'es' => "La VM {vm} está ahora en estado '{st}'."],
+
+    // ---- system
+    "Server was restarted" => [
+        'de' => "Server wurde neu gestartet", 'fr' => "Le serveur a redémarré", 'es' => "El servidor se ha reiniciado"],
+    "The server has been up for {m} min. If the restart was not planned, check the syslog." => [
+        'de' => "Der Server läuft seit {m} min. Falls der Neustart nicht geplant war, das Syslog prüfen.",
+        'fr' => "Le serveur fonctionne depuis {m} min. Si le redémarrage n'était pas prévu, consultez le syslog.",
+        'es' => "El servidor lleva {m} min en marcha. Si el reinicio no estaba previsto, revise el syslog."],
+    "High CPU load" => [
+        'de' => "Hohe CPU-Last", 'fr' => "Charge CPU élevée", 'es' => "Carga de CPU alta"],
+    "5-minute load {l} on {c} CPUs ({p} %, warning from {w} %)." => [
+        'de' => "5-Minuten-Last {l} auf {c} CPUs ({p} %, Warnung ab {w} %).",
+        'fr' => "Charge sur 5 minutes {l} sur {c} CPU ({p} %, avertissement à partir de {w} %).",
+        'es' => "Carga de 5 minutos {l} en {c} CPU ({p} %, aviso desde {w} %)."],
+    "Memory running low" => [
+        'de' => "Arbeitsspeicher wird knapp", 'fr' => "Mémoire faible", 'es' => "Memoria escasa"],
+    "{p} % used, available: {a}." => [
+        'de' => "{p} % belegt, verfügbar: {a}.", 'fr' => "{p} % utilisés, disponible : {a}.",
+        'es' => "{p} % en uso, disponible: {a}."],
+
+    // ---- UPS
+    "Power outage: UPS on battery" => [
+        'de' => "Stromausfall: USV im Batteriebetrieb", 'fr' => "Panne de courant : onduleur sur batterie",
+        'es' => "Corte de luz: SAI funcionando con batería"],
+    "Lost connection to UPS" => [
+        'de' => "Verbindung zur USV verloren", 'fr' => "Connexion à l'onduleur perdue", 'es' => "Conexión con el SAI perdida"],
+    "Replace UPS battery" => [
+        'de' => "USV-Batterie ersetzen", 'fr' => "Remplacer la batterie de l'onduleur", 'es' => "Sustituir la batería del SAI"],
+    "Status: {st}, charge: {c}, time left: {t}." => [
+        'de' => "Status: {st}, Ladung: {c}, Restlaufzeit: {t}.",
+        'fr' => "État : {st}, charge : {c}, autonomie restante : {t}.",
+        'es' => "Estado: {st}, carga: {c}, tiempo restante: {t}."],
+
+    // ---- TLS certificates
+    "Certificate directory not found" => [
+        'de' => "Zertifikatsverzeichnis nicht gefunden", 'fr' => "Répertoire de certificats introuvable",
+        'es' => "Directorio de certificados no encontrado"],
+    "The directory {d} does not exist. Check the path in the settings (CERT_DIRS)." => [
+        'de' => "Das Verzeichnis {d} existiert nicht. Pfad in den Einstellungen prüfen (CERT_DIRS).",
+        'fr' => "Le répertoire {d} n'existe pas. Vérifiez le chemin dans les paramètres (CERT_DIRS).",
+        'es' => "El directorio {d} no existe. Compruebe la ruta en la configuración (CERT_DIRS)."],
+    "Certificate {label} not readable" => [
+        'de' => "Zertifikat {label} nicht lesbar", 'fr' => "Certificat {label} illisible", 'es' => "Certificado {label} ilegible"],
+    "File: {path}" => [
+        'de' => "Datei: {path}", 'fr' => "Fichier : {path}", 'es' => "Archivo: {path}"],
+    "Certificate {label} has expired" => [
+        'de' => "Zertifikat {label} ist abgelaufen", 'fr' => "Le certificat {label} a expiré",
+        'es' => "El certificado {label} ha caducado"],
+    "Certificate {label} expires in {d} days" => [
+        'de' => "Zertifikat {label} läuft in {d} Tagen ab", 'fr' => "Le certificat {label} expire dans {d} jours",
+        'es' => "El certificado {label} caduca en {d} días"],
+    "Certificate for {names} ({id}, issuer {iss}) valid until {date}. Let's Encrypt normally renews 30 days before expiry; check the renewal in Nginx Proxy Manager." => [
+        'de' => "Zertifikat für {names} ({id}, Aussteller {iss}) gültig bis {date}. Let's Encrypt erneuert normalerweise 30 Tage vor Ablauf; die Erneuerung in Nginx Proxy Manager prüfen.",
+        'fr' => "Certificat pour {names} ({id}, émetteur {iss}) valide jusqu'au {date}. Let's Encrypt renouvelle normalement 30 jours avant l'expiration ; vérifiez le renouvellement dans Nginx Proxy Manager.",
+        'es' => "Certificado para {names} ({id}, emisor {iss}) válido hasta {date}. Let's Encrypt suele renovar 30 días antes de la caducidad; compruebe la renovación en Nginx Proxy Manager."],
+    "TLS check for {h} failed" => [
+        'de' => "TLS-Prüfung für {h} fehlgeschlagen", 'fr' => "Échec de la vérification TLS pour {h}",
+        'es' => "Falló la comprobación TLS de {h}"],
+    "No TLS connection to {a}. If the server cannot reach its public address (no NAT loopback on the router), enter it as {h}@<LAN-IP>:<NPM-HTTPS-port>." => [
+        'de' => "Keine TLS-Verbindung zu {a}. Wenn der Server seine öffentliche Adresse nicht erreicht (kein NAT-Loopback im Router), als {h}@<LAN-IP>:<NPM-HTTPS-Port> eintragen.",
+        'fr' => "Pas de connexion TLS vers {a}. Si le serveur ne peut pas joindre son adresse publique (pas de NAT loopback sur le routeur), saisissez {h}@<IP-LAN>:<port-HTTPS-NPM>.",
+        'es' => "Sin conexión TLS con {a}. Si el servidor no puede alcanzar su dirección pública (sin NAT loopback en el router), introdúzcalo como {h}@<IP-LAN>:<puerto-HTTPS-NPM>."],
+    "No TLS connection to {a}. Is Nginx Proxy Manager running and is the port correct?" => [
+        'de' => "Keine TLS-Verbindung zu {a}. Läuft Nginx Proxy Manager und stimmt der Port?",
+        'fr' => "Pas de connexion TLS vers {a}. Nginx Proxy Manager est-il démarré et le port est-il correct ?",
+        'es' => "Sin conexión TLS con {a}. ¿Está en marcha Nginx Proxy Manager y es correcto el puerto?"],
+    "Certificate could not be parsed. If the server cannot reach its public address (no NAT loopback on the router), enter it as {h}@<LAN-IP>:<NPM-HTTPS-port>." => [
+        'de' => "Zertifikat konnte nicht gelesen werden. Wenn der Server seine öffentliche Adresse nicht erreicht (kein NAT-Loopback im Router), als {h}@<LAN-IP>:<NPM-HTTPS-Port> eintragen.",
+        'fr' => "Le certificat n'a pas pu être analysé. Si le serveur ne peut pas joindre son adresse publique (pas de NAT loopback sur le routeur), saisissez {h}@<IP-LAN>:<port-HTTPS-NPM>.",
+        'es' => "No se pudo analizar el certificado. Si el servidor no puede alcanzar su dirección pública (sin NAT loopback en el router), introdúzcalo como {h}@<IP-LAN>:<puerto-HTTPS-NPM>."],
+    "Certificate could not be parsed. Is Nginx Proxy Manager running and is the port correct?" => [
+        'de' => "Zertifikat konnte nicht gelesen werden. Läuft Nginx Proxy Manager und stimmt der Port?",
+        'fr' => "Le certificat n'a pas pu être analysé. Nginx Proxy Manager est-il démarré et le port est-il correct ?",
+        'es' => "No se pudo analizar el certificado. ¿Está en marcha Nginx Proxy Manager y es correcto el puerto?"],
+    "Served certificate for {h} has expired" => [
+        'de' => "Ausgeliefertes Zertifikat für {h} ist abgelaufen", 'fr' => "Le certificat servi pour {h} a expiré",
+        'es' => "El certificado servido para {h} ha caducado"],
+    "Served certificate for {h} expires in {d} days" => [
+        'de' => "Ausgeliefertes Zertifikat für {h} läuft in {d} Tagen ab",
+        'fr' => "Le certificat servi pour {h} expire dans {d} jours",
+        'es' => "El certificado servido para {h} caduca en {d} días"],
+    "{a}:{p} serves a certificate (issuer {iss}) valid until {date}." => [
+        'de' => "{a}:{p} liefert ein Zertifikat aus (Aussteller {iss}), gültig bis {date}.",
+        'fr' => "{a}:{p} sert un certificat (émetteur {iss}) valide jusqu'au {date}.",
+        'es' => "{a}:{p} sirve un certificado (emisor {iss}) válido hasta {date}."],
+    "Certificate for {h} not trusted" => [
+        'de' => "Zertifikat für {h} nicht vertrauenswürdig", 'fr' => "Certificat pour {h} non approuvé",
+        'es' => "Certificado de {h} no confiable"],
+    "Verification reports: {v} (code {c}). Causes: wrong hostname, missing intermediate certificates or a self-signed certificate." => [
+        'de' => "Die Prüfung meldet: {v} (Code {c}). Ursachen: falscher Hostname, fehlende Zwischenzertifikate oder ein selbstsigniertes Zertifikat.",
+        'fr' => "La vérification signale : {v} (code {c}). Causes : nom d'hôte incorrect, certificats intermédiaires manquants ou certificat auto-signé.",
+        'es' => "La verificación informa: {v} (código {c}). Causas: nombre de host incorrecto, certificados intermedios ausentes o un certificado autofirmado."],
+    "Outdated certificate served for {h}" => [
+        'de' => "Veraltetes Zertifikat für {h} ausgeliefert", 'fr' => "Certificat obsolète servi pour {h}",
+        'es' => "Se sirve un certificado obsoleto para {h}"],
+    "A certificate valid until {d1} exists on disk, but one valid until {d2} is being served. Nginx Proxy Manager probably did not load the renewal; restart the container." => [
+        'de' => "Auf dem Datenträger liegt ein Zertifikat gültig bis {d1}, ausgeliefert wird aber eines gültig bis {d2}. Nginx Proxy Manager hat die Erneuerung vermutlich nicht geladen; Container neu starten.",
+        'fr' => "Un certificat valide jusqu'au {d1} existe sur le disque, mais un certificat valide jusqu'au {d2} est servi. Nginx Proxy Manager n'a probablement pas chargé le renouvellement ; redémarrez le conteneur.",
+        'es' => "En el disco hay un certificado válido hasta {d1}, pero se sirve uno válido hasta {d2}. Probablemente Nginx Proxy Manager no cargó la renovación; reinicie el contenedor."],
+
+    // ---- updates
+    "{n} Docker update(s) available" => [
+        'de' => "{n} Docker-Update(s) verfügbar", 'fr' => "{n} mise(s) à jour Docker disponible(s)",
+        'es' => "{n} actualización(es) de Docker disponible(s)"],
+    "{items}. Update via the Docker tab." => [
+        'de' => "{items}. Aktualisieren über den Docker-Tab.", 'fr' => "{items}. Mettez à jour via l'onglet Docker.",
+        'es' => "{items}. Actualice desde la pestaña Docker."],
+    "Unraid OS {v} available" => [
+        'de' => "Unraid OS {v} verfügbar", 'fr' => "Unraid OS {v} disponible", 'es' => "Unraid OS {v} disponible"],
+    "Installed: {c}. Update via Tools > Update OS; read the release notes first." => [
+        'de' => "Installiert: {c}. Aktualisieren über Tools > Update OS; vorher die Release Notes lesen.",
+        'fr' => "Installée : {c}. Mettez à jour via Tools > Update OS ; lisez d'abord les notes de version.",
+        'es' => "Instalada: {c}. Actualice desde Tools > Update OS; lea antes las notas de la versión."],
+    "Installed: {c}. Not eligible: the update period of the license has ended ({e}). Extend the license to install this version." => [
+        'de' => "Installiert: {c}. Nicht berechtigt: Der Update-Zeitraum der Lizenz ist abgelaufen ({e}). Lizenz verlängern, um diese Version zu installieren.",
+        'fr' => "Installée : {c}. Non éligible : la période de mise à jour de la licence est terminée ({e}). Prolongez la licence pour installer cette version.",
+        'es' => "Instalada: {c}. No elegible: el periodo de actualizaciones de la licencia ha terminado ({e}). Amplíe la licencia para instalar esta versión."],
+    "Installed: {c}. Not eligible: the update period of the license has ended. Extend the license to install this version." => [
+        'de' => "Installiert: {c}. Nicht berechtigt: Der Update-Zeitraum der Lizenz ist abgelaufen. Lizenz verlängern, um diese Version zu installieren.",
+        'fr' => "Installée : {c}. Non éligible : la période de mise à jour de la licence est terminée. Prolongez la licence pour installer cette version.",
+        'es' => "Instalada: {c}. No elegible: el periodo de actualizaciones de la licencia ha terminado. Amplíe la licencia para instalar esta versión."],
+    "{n} plugin update(s) available" => [
+        'de' => "{n} Plugin-Update(s) verfügbar", 'fr' => "{n} mise(s) à jour de plugin disponible(s)",
+        'es' => "{n} actualización(es) de plugin disponible(s)"],
+    "{items}. Update via the Plugins tab." => [
+        'de' => "{items}. Aktualisieren über den Plugins-Tab.", 'fr' => "{items}. Mettez à jour via l'onglet Plugins.",
+        'es' => "{items}. Actualice desde la pestaña Plugins."],
+    "Plugin {n} updated" => [
+        'de' => "Plugin {n} aktualisiert", 'fr' => "Plugin {n} mis à jour", 'es' => "Plugin {n} actualizado"],
+    "Plugin updated: {item}." => [
+        'de' => "Plugin aktualisiert: {item}.", 'fr' => "Plugin mis à jour : {item}.", 'es' => "Plugin actualizado: {item}."],
+    "{n} plugins updated" => [
+        'de' => "{n} Plugins aktualisiert", 'fr' => "{n} plugins mis à jour", 'es' => "{n} plugins actualizados"],
+];
+
+/** Valid language code from the configuration, otherwise English. */
+function sm_lang(array $cfg, string $key): string
+{
+    $l = strtolower(trim((string)($cfg[$key] ?? 'en')));
+    return isset(SM_LANGS[$l]) ? $l : 'en';
+}
+
+/** Translate an English notification text, see the comment at the top. */
+function sm_tr(string $text, string $lang, int $depth = 0): string
+{
+    if ($lang === 'en' || !isset(SM_LANGS[$lang]) || $depth > 3) return $text;
+    static $rx = null;
+    if ($rx === null) {
+        // compile the templates to anchored regular expressions, most specific (most literal text) first
+        $rx = [];
+        foreach (SM_TEXTS as $tpl => $tr) {
+            $parts = preg_split('/\{(@?\w+)\}/', $tpl, -1, PREG_SPLIT_DELIM_CAPTURE);
+            $re = ''; $names = []; $lit = 0;
+            foreach ($parts as $i => $p) {
+                if ($i % 2) { $re .= '(.+?)'; $names[] = $p; }
+                else        { $re .= preg_quote($p, '/'); $lit += strlen($p); }
+            }
+            $rx[] = ['/^' . $re . '$/su', $tpl, $names, $lit];
+        }
+        usort($rx, fn($a, $b) => $b[3] <=> $a[3]);
+    }
+    foreach ($rx as [$re, $tpl, $names]) {
+        if (!isset(SM_TEXTS[$tpl][$lang]) || !preg_match($re, $text, $m)) continue;
+        $rep = [];
+        foreach ($names as $i => $n) {
+            $v = $m[$i + 1];
+            $rep['{' . $n . '}'] = $n[0] === '@' ? sm_tr($v, $lang, $depth + 1) : $v;
+        }
+        return strtr(SM_TEXTS[$tpl][$lang], $rep);
+    }
+    return $text;
+}
+]]></INLINE>
+</FILE>
+
 <FILE Name="&emhttp;/include/data.php">
 <INLINE><![CDATA[<?php
 /*
@@ -646,10 +1039,21 @@ if (sm_on($cfg, 'CHECK_VMS')) {
 }
 if (sm_on($cfg, 'CHECK_UPS'))     $out['ups']     = sm_get_ups();
 if (sm_on($cfg, 'CHECK_UPDATES')) $out['updates'] = sm_get_updates();
-if (sm_on($cfg, 'CHECK_OS_UPDATES') || sm_on($cfg, 'CHECK_PLUGIN_UPDATES')) {
+if (sm_on($cfg, 'CHECK_OS_UPDATES') || sm_on($cfg, 'CHECK_PLUGIN_UPDATES') || sm_on($cfg, 'CHECK_PLUGIN_UPDATED')) {
     $out['sysupd'] = ['os_current' => sm_os_version()];
     if (sm_on($cfg, 'CHECK_OS_UPDATES'))     $out['sysupd']['os']      = sm_get_os_update();
     if (sm_on($cfg, 'CHECK_PLUGIN_UPDATES')) $out['sysupd']['plugins'] = sm_get_plugin_updates();
+    if (sm_on($cfg, 'CHECK_PLUGIN_UPDATED')) {
+        // plugins updated in the last 7 days, newest first (state of the last check)
+        $recent = [];
+        foreach ($state['plugins'] ?? [] as $n => $p) {
+            if (!empty($p['updated']) && time() - (int)$p['updated'] < 7 * 86400) {
+                $recent[] = ['name' => (string)$n, 'version' => (string)$p['version'], 'updated' => (int)$p['updated']];
+            }
+        }
+        usort($recent, fn($a, $b) => $b['updated'] <=> $a['updated']);
+        $out['sysupd']['recent'] = $recent;
+    }
 }
 if (sm_on($cfg, 'CHECK_CERTS')) {
     // result of the last check run; no TLS handshakes on every page load
@@ -678,6 +1082,7 @@ echo json_encode($out, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
  */
 declare(strict_types=1);
 require_once '/usr/local/emhttp/plugins/srvmon/include/lib.php';
+require_once '/usr/local/emhttp/plugins/srvmon/include/lang.php';
 
 const SM_MAX_PER_RUN = 10;
 const SM_MAX_HOOKS   = 3;     // webhook calls per run, so a voice assistant does not talk for minutes
@@ -718,6 +1123,7 @@ if (sm_on($cfg, 'CHECK_UPS'))     sm_check_ups($issues, $ran);
 if (sm_on($cfg, 'CHECK_UPDATES')) sm_check_updates($state, $events);
 if (sm_on($cfg, 'CHECK_OS_UPDATES'))     sm_check_os_update($state, $events);
 if (sm_on($cfg, 'CHECK_PLUGIN_UPDATES')) sm_check_plugin_updates($state, $events);
+if (sm_on($cfg, 'CHECK_PLUGIN_UPDATED')) sm_check_plugin_updated($state, $events);
 if (sm_on($cfg, 'CHECK_CERTS'))   sm_check_certs($cfg, $force, $state, $issues, $ran);
 
 // ---------------------------------------------------------------- Evaluation
@@ -1176,6 +1582,35 @@ function sm_check_plugin_updates(array &$state, array &$events): void
     $state['plugin_updates'] = $now;
 }
 
+/**
+ * Reports performed plugin updates (installed version changed), all plugins of a run in one notification.
+ * Newly installed plugins have no previous version and are not reported. Plugins missing in this run
+ * (e.g. still being installed during boot) lose their baseline, so no false report is possible.
+ */
+function sm_check_plugin_updated(array &$state, array &$events): void
+{
+    $list = sm_get_plugins();
+    if ($list === null) return;
+    $prev  = $state['plugins'] ?? [];
+    $now   = [];
+    $items = [];
+    foreach ($list as $name => $ver) {
+        $p = $prev[$name] ?? null;
+        $e = ['version' => $ver, 'updated' => $p['updated'] ?? null];
+        if (is_array($p) && (string)$p['version'] !== $ver) {
+            $e['updated'] = time();
+            $items[$name] = "$name {$p['version']} -> $ver";
+        }
+        $now[$name] = $e;
+    }
+    if (count($items) === 1) {
+        $events[] = ['normal', 'Plugin ' . array_key_first($items) . ' updated', 'Plugin updated: ' . reset($items) . '.'];
+    } elseif ($items) {
+        $events[] = ['normal', count($items) . ' plugins updated', implode('; ', $items) . '.'];
+    }
+    $state['plugins'] = $now;
+}
+
 // ================================================================== Helpers
 
 function sm_send(string $lvl, string $subj, string $desc, bool $forceHook = false): void
@@ -1183,12 +1618,22 @@ function sm_send(string $lvl, string $subj, string $desc, bool $forceHook = fals
     global $dry, $cfg, $smHookSent, $smHookSkipped;
     $url  = trim((string)($cfg['WEBHOOK_URL'] ?? ''));
     $hook = $url !== '' && ($forceHook || sm_rank($lvl) >= sm_rank((string)($cfg['WEBHOOK_LEVEL'] ?? 'warning')));
-    if ($dry) { echo "[$lvl] $subj - $desc" . ($hook ? ' [+Webhook]' : '') . "\n"; return; }
+    $nl   = sm_lang($cfg, 'NOTIFY_LANG');    // Unraid notification
+    $wl   = sm_lang($cfg, 'WEBHOOK_LANG');   // webhook; the syslog always stays English
+    $host  = gethostname() ?: 'Unraid';
+    $intro = ['alert' => 'Alert', 'warning' => 'Warning'][$lvl] ?? 'Notice';
+    $speech = "$intro from server $host: $subj";
+    if ($dry) {
+        echo "[$lvl] $subj - $desc" . ($hook ? ' [+Webhook]' : '') . "\n";
+        if ($nl !== 'en') echo "    Unraid ($nl): " . sm_tr($subj, $nl) . ' - ' . sm_tr($desc, $nl) . "\n";
+        if ($hook && $wl !== 'en') echo "    Webhook ($wl): " . sm_tr($speech, $wl) . "\n";
+        return;
+    }
 
     exec(SM_NOTIFY
         . ' -e ' . escapeshellarg('Server Monitor')
-        . ' -s ' . escapeshellarg("srvmon: $subj")
-        . ' -d ' . escapeshellarg($desc)
+        . ' -s ' . escapeshellarg('srvmon: ' . sm_tr($subj, $nl))
+        . ' -d ' . escapeshellarg(sm_tr($desc, $nl))
         . ' -i ' . escapeshellarg($lvl)
         . ' >/dev/null 2>&1');
     exec('logger -t srvmon ' . escapeshellarg("[$lvl] $subj - $desc"));
@@ -1196,11 +1641,9 @@ function sm_send(string $lvl, string $subj, string $desc, bool $forceHook = fals
     if (!$hook) return;
     if ((int)$smHookSent >= SM_MAX_HOOKS) { $smHookSkipped = (int)$smHookSkipped + 1; return; }
     $smHookSent = (int)$smHookSent + 1;
-    $host  = gethostname() ?: 'Unraid';
-    $intro = ['alert' => 'Alert', 'warning' => 'Warning'][$lvl] ?? 'Notice';
     sm_webhook($url, [
-        'level' => $lvl, 'subject' => $subj, 'description' => $desc,
-        'speech' => "$intro from server $host: $subj",
+        'level' => $lvl, 'subject' => sm_tr($subj, $wl), 'description' => sm_tr($desc, $wl),
+        'speech' => sm_tr($speech, $wl), 'lang' => $wl,
         'host' => $host, 'time' => time(),
     ]);
 }
@@ -1211,11 +1654,12 @@ function sm_webhook_flush(): void
     global $dry, $cfg, $smHookSkipped;
     if ($dry || (int)$smHookSkipped === 0) return;
     $host = gethostname() ?: 'Unraid';
+    $wl   = sm_lang($cfg, 'WEBHOOK_LANG');
     sm_webhook(trim((string)$cfg['WEBHOOK_URL']), [
-        'level' => 'warning', 'subject' => "$smHookSkipped more notifications",
-        'description' => 'Details in the Unraid notifications.',
-        'speech' => "Server $host has $smHookSkipped more notifications. Details in Unraid.",
-        'host' => $host, 'time' => time(),
+        'level' => 'warning', 'subject' => sm_tr("$smHookSkipped more notifications", $wl),
+        'description' => sm_tr('Details in the Unraid notifications.', $wl),
+        'speech' => sm_tr("Server $host has $smHookSkipped more notifications. Details in Unraid.", $wl),
+        'lang' => $wl, 'host' => $host, 'time' => time(),
     ]);
 }
 
@@ -1265,7 +1709,16 @@ $sm = array_merge(
     @parse_ini_file('/boot/config/plugins/srvmon/srvmon.cfg') ?: []
 );
 $smStatus = json_decode((string)@file_get_contents('/tmp/srvmon/status.json'), true) ?: [];
+require_once '/usr/local/emhttp/plugins/srvmon/include/lang.php';
 if (!function_exists('sm_v')) {
+    function sm_langsel(array $c, string $k): string {
+        $cur = (string)($c[$k] ?? 'en');
+        $o = '';
+        foreach (SM_LANGS as $v => $t) {
+            $o .= '<option value="' . $v . '"' . ($cur === $v ? ' selected' : '') . '>' . htmlspecialchars($t) . '</option>';
+        }
+        return '<select name="' . $k . '">' . $o . '</select>';
+    }
     function sm_v(array $c, string $k): string {
         return htmlspecialchars((string)($c[$k] ?? ''), ENT_QUOTES);
     }
@@ -1319,6 +1772,9 @@ Reminder for ongoing problems (hours, 0 = off):
 Notify when a problem is resolved:
 : <?=sm_yn($sm,'NOTIFY_RESOLVED')?>
 
+Language of Unraid notifications:
+: <?=sm_langsel($sm,'NOTIFY_LANG')?>
+
 <div class="srvmon-sec">Disks and SMART</div>
 
 Check disks (status, errors, temperature):
@@ -1365,6 +1821,9 @@ Notify about Unraid OS updates:
 
 Notify about plugin updates:
 : <?=sm_yn($sm,'CHECK_PLUGIN_UPDATES')?>
+
+Notify about performed plugin updates:
+: <?=sm_yn($sm,'CHECK_PLUGIN_UPDATED')?>
 
 <div class="srvmon-sec">VMs</div>
 
@@ -1415,6 +1874,9 @@ Webhook URL (e.g. Home Assistant):
 
 Send webhook for:
 : <?=sm_lvl($sm,'WEBHOOK_LEVEL')?>
+
+Webhook language:
+: <?=sm_langsel($sm,'WEBHOOK_LANG')?>
 
 Heartbeat URL (external outage monitoring):
 : <input type="text" name="HEARTBEAT_URL" value="<?=sm_v($sm,'HEARTBEAT_URL')?>" style="width:30em" placeholder="https://hc-ping.com/...">
@@ -1583,6 +2045,12 @@ Markdown="false"
             b+='</tbody></table></div>';}
           if(p.checked)b+='<div class="smd-row smd-muted"><span>Checked</span><span>'+fmtT(p.checked)+'</span></div>';}
       }
+      if(su.recent&&su.recent.length){
+        b+='<div class="smd-row" style="margin-top:.6em"><span>Updated in the last 7 days</span></div><div class="smd-scroll"><table><tbody>';
+        su.recent.forEach(function(r){b+='<tr><td>'+esc(r.name)+'</td><td class="smd-muted">'+esc(r.version)+'</td><td class="smd-muted">'+fmtT(r.updated)+'</td></tr>';});
+        b+='</tbody></table></div>';
+      }
+      if(!b)b='<span class="smd-muted">No plugin updates in the last 7 days.</span>';
       h+=card('Unraid OS and plugins',b);
     }
     if('certs' in d){
