@@ -2,7 +2,7 @@
 
 srvmon monitors the health of an Unraid server and reports relevant events through Unraid's own notification system (email, push services) and optionally via webhook, for example to Home Assistant for Alexa announcements. It also provides a live status page in the WebGUI.
 
-Version: 2026.10.18l
+Version: 2026.10.18m
 Repository: https://github.com/MarioKonang/unraid-srvmon
 Target platform: Unraid 6.12 and newer (used on 7.2.3, see [Verification status](#verification-status))
 
@@ -137,7 +137,7 @@ Not reported as an update:
 
 **Source:** as with Docker, srvmon does not contact the release server or plugin repositories itself. It reads the results of Unraid's own checks:
 
-- **Unraid OS:** `/tmp/unraidcheck/result.json`, written by Unraid's OS update check. The installed version comes from `/etc/unraid-version`. Versions ignored in the *Update OS* dialog (`/tmp/unraidcheck/ignored.json`) are not reported.
+- **Unraid OS:** `/tmp/unraidcheck/result.json`, written by Unraid's OS update check. The installed version comes from `/etc/unraid-version`. Versions ignored in the *Update OS* dialog (`/tmp/unraidcheck/ignored.json`) are not reported. If the update period of the license has ended (`isEligible` is `false`), the update is still reported, with a note that the license must be extended first and the end date of the update period.
 - **Plugins:** Unraid's plugin check downloads the current `.plg` of every installed plugin to `/tmp/plugins/`. srvmon compares its version with the installed plugin in `/var/log/plugins/`, using the same rules as Unraid: string comparison of the version, and the `min`/`max` OS version of the new plugin must fit the installed Unraid version. srvmon itself is included.
 
 Both results live in RAM and are empty after a reboot until Unraid's next check. In that case srvmon reports nothing and keeps its last state, so known updates are not reported again.
@@ -413,7 +413,7 @@ Then adjust the settings under *Settings > User Utilities > Server Monitor*.
 
 ### Updating
 
-- **Installed via URL:** click *Check for updates* under *Plugins* and install the update. For developers: a new version must have a higher `version` entity in the `.plg`, otherwise Unraid does not detect an update.
+- **Installed via URL:** click *Check for updates* under *Plugins* and install the update. For developers: a new version must have a higher `version` entity in the `.plg`, otherwise Unraid does not detect an update. Unraid does not overwrite existing files during an update; the first step of the `.plg` therefore deletes `/usr/local/emhttp/plugins/srvmon` before the files are written. Updating from 2026.10.18l or older to 2026.10.18m or newer works normally, because the cleanup step of the new version runs.
 - **Installed from a local file:** remove the old plugin and install the new file:
   ```bash
   plugin remove srvmon.plg
@@ -666,6 +666,7 @@ srvmon was developed and tested with simulated Unraid files and tools and has si
 - certificate files of Nginx Proxy Manager (image `jlesage`), detection of superseded certificates
 - live check with `openssl s_client`, including trust verification with the system's CA certificates
 - webhook to Home Assistant and Alexa announcement
+- format of the OS update check result `/tmp/unraidcheck/result.json` (fields `isNewer`, `version`, `isEligible`, `params.update_exp`) and the downloaded `.plg` files in `/tmp/plugins/` (checked on 7.2.4)
 
 **Not yet confirmed:**
 
@@ -676,8 +677,6 @@ srvmon was developed and tested with simulated Unraid files and tools and has si
 | Docker converts `\t` in `--format` templates to tabs | `docker inspect --format '{{.Name}}\t{{.Image}}' $(docker ps -aq)` must print tab-separated lines |
 | plugin attributes `icon`, `launch` and `support` are evaluated in the plugin list | check the plugin list: icon, clickable name, support link |
 | header `Markdown="false"` on the status page | open the status page and check for rendering errors |
-| format of the OS check result (fields `isNewer`, `version`, `error`), taken from the Unraid source code | `cat /tmp/unraidcheck/result.json` after *Tools > Update OS* |
-| plugin check leaves the new `.plg` in `/tmp/plugins/`, taken from the Unraid source code | `ls -l /tmp/plugins/` after *Plugins > Check for updates* |
 
 ---
 
@@ -701,6 +700,10 @@ srvmon was developed and tested with simulated Unraid files and tools and has si
 ---
 
 ## Changelog
+
+### 2026.10.18m
+- Fix: updates via the Plugins tab did not replace the program files, because Unraid does not overwrite existing files. The previous version kept running although the new version was shown. The installation now removes the old program files first; configuration and state are kept.
+- Unraid OS update: if the update period of the license has ended (`isEligible` in the check result), the notification and the status page say so
 
 ### 2026.10.18l
 - Notification about available Unraid OS and plugin updates, based on Unraid's own update checks, once per new version

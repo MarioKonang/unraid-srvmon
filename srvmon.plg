@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "srvmon">
 <!ENTITY author    "MarioKonang">
-<!ENTITY version   "2026.10.18l">
+<!ENTITY version   "2026.10.18m">
 <!ENTITY repo      "https://github.com/MarioKonang/unraid-srvmon">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/MarioKonang/unraid-srvmon/main/srvmon.plg">
 <!ENTITY emhttp    "/usr/local/emhttp/plugins/&name;">
@@ -11,6 +11,10 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" pluginURL="&pluginURL;" min="6.12.0" icon="heartbeat" launch="Settings/srvmon" support="&repo;">
 
 <CHANGES>
+###2026.10.18m
+- Fix: updates via the Plugins tab did not replace the program files, so the previous version kept running. Old program files are now removed before installation.
+- Unraid OS update: hint if the update period of the license has ended (isEligible), also on the status page
+
 ###2026.10.18l
 - Notification about available Unraid OS and plugin updates (from Unraid's own update checks, once per new version)
 - Status page: new card "Unraid OS and plugins"
@@ -62,6 +66,15 @@
 ###2026.10.18
 - First version: disks, SMART, storage, Docker, VMs, system, UPS, Docker updates
 </CHANGES>
+
+<!-- Unraid's plugin manager does not overwrite existing files on update.
+     Remove the old program files first so the INLINE files below are written fresh.
+     Configuration and state live in &plgpath; and are not touched. -->
+<FILE Run="/bin/bash">
+<INLINE>
+rm -rf &emhttp;
+</INLINE>
+</FILE>
 
 <FILE Name="&emhttp;/README.md">
 <INLINE><![CDATA[**Server Monitor (srvmon)**
@@ -409,6 +422,9 @@ function sm_get_os_update(): ?array
         'current' => $cur,
         'version' => $newer ? $ver : null,
         'ignored' => $newer && in_array($ver, $ign, true),
+        // false if the update period of the license has ended (field missing on older versions: assume eligible)
+        'eligible'   => ($j['isEligible'] ?? true) !== false,
+        'update_exp' => (string)($j['params']['update_exp'] ?? ''),
         'error'   => isset($j['error']) ? (string)$j['error'] : null,
         'checked' => (int)@filemtime(SM_OS_CHECK),
     ];
@@ -1132,8 +1148,11 @@ function sm_check_os_update(array &$state, array &$events): void
     if ($u === null || $u['error'] !== null) return;   // no or failed check: keep the last state
     $ver = ($u['version'] !== null && !$u['ignored']) ? $u['version'] : '';
     if ($ver !== '' && $ver !== ($state['os_update'] ?? '')) {
-        $events[] = ['normal', "Unraid OS $ver available",
-            "Installed: {$u['current']}. Update via Tools > Update OS; read the release notes first."];
+        $desc = $u['eligible']
+            ? "Installed: {$u['current']}. Update via Tools > Update OS; read the release notes first."
+            : "Installed: {$u['current']}. Not eligible: the update period of the license has ended"
+              . ($u['update_exp'] !== '' ? " ({$u['update_exp']})" : '') . '. Extend the license to install this version.';
+        $events[] = ['normal', "Unraid OS $ver available", $desc];
     }
     $state['os_update'] = $ver;
 }
@@ -1548,9 +1567,10 @@ Markdown="false"
         var o=su.os,os;
         if(!o)os='<span class="smd-muted">no check since boot</span>';
         else if(o.error)os='<span class="smd-warn">check failed</span>';
-        else if(o.version)os=o.ignored?'<span class="smd-muted">'+esc(o.version)+' (ignored)</span>':chip(o.version+' available','smd-warn');
+        else if(o.version)os=o.ignored?'<span class="smd-muted">'+esc(o.version)+' (ignored)</span>':chip(o.version+' available','smd-warn')+(o.eligible===false?' <span class="smd-muted">not eligible</span>':'');
         else os='<span class="smd-ok">up to date</span>';
         b+='<div class="smd-row"><span>Unraid OS '+esc(su.os_current||'?')+'</span><span>'+os+'</span></div>';
+        if(o&&o.version&&o.eligible===false)b+='<div class="smd-row smd-muted"><span>License update period</span><span class="smd-warn">ended'+(o.update_exp?' '+esc(o.update_exp):'')+'</span></div>';
         if(o&&o.checked)b+='<div class="smd-row smd-muted"><span>Checked</span><span>'+fmtT(o.checked)+'</span></div>';
       }
       if('plugins' in su){
