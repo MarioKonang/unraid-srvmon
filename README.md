@@ -1,500 +1,495 @@
-# srvmon – Server Monitor für Unraid
+# srvmon – Server Monitor for Unraid
 
-srvmon überwacht den Zustand eines Unraid-Servers und meldet relevante Ereignisse über Unraids eigenes Benachrichtigungssystem, auf Wunsch per E-Mail. Zusätzlich bietet es eine Live-Statusseite in der WebGUI.
+srvmon monitors the health of an Unraid server and reports relevant events through Unraid's own notification system (email, push services) and optionally via webhook, for example to Home Assistant for Alexa announcements. It also provides a live status page in the WebGUI.
 
-Version: 2026.10.18i
-Zielplattform: Unraid 6.12 und neuer (ausgelegt für 7.2.x, siehe [Ungeprüfte Annahmen](#ungeprüfte-annahmen))
-
----
-
-## Inhalt
-
-1. [Funktionen](#funktionen)
-2. [Benachrichtigungslogik](#benachrichtigungslogik)
-3. [Statusseite](#statusseite)
-4. [Installation](#installation)
-5. [Konfiguration](#konfiguration)
-6. [Kommandozeile](#kommandozeile)
-7. [Dateien und Pfade](#dateien-und-pfade)
-8. [Datenquellen](#datenquellen)
-9. [Sicherheit](#sicherheit)
-10. [Bekannte Grenzen](#bekannte-grenzen)
-11. [Ungeprüfte Annahmen](#ungeprüfte-annahmen)
-12. [Fehlersuche](#fehlersuche)
-13. [Änderungen](#änderungen)
+Version: 2026.10.18k
+Repository: https://github.com/MarioKonang/unraid-srvmon
+Target platform: Unraid 6.12 and newer (used on 7.2.3, see [Verification status](#verification-status))
 
 ---
 
-## Funktionen
+## Contents
 
-Jede Prüfung lässt sich in den Einstellungen einzeln abschalten. Die Level entsprechen den Unraid-Stufen `normal` (Notice), `warning` und `alert`.
+1. [Features](#features)
+2. [Notification logic](#notification-logic)
+3. [Additional notification channels](#additional-notification-channels)
+4. [Status page](#status-page)
+5. [Installation](#installation)
+6. [Configuration](#configuration)
+7. [Command line](#command-line)
+8. [Files and paths](#files-and-paths)
+9. [Data sources](#data-sources)
+10. [Security](#security)
+11. [Known limitations](#known-limitations)
+12. [Verification status](#verification-status)
+13. [Troubleshooting](#troubleshooting)
+14. [Changelog](#changelog)
+
+---
+
+## Features
+
+Every check can be switched off individually in the settings. Levels correspond to Unraid's levels `normal` (notice), `warning` and `alert`.
 
 ### Disks
 
-| Prüfung | Bedingung | Level |
+| Check | Condition | Level |
 |---|---|---|
-| Disk-Status | Status ungleich `DISK_OK` | alert |
-| E/A-Fehler | Unraids Fehlerzähler `numErrors` > 0 | alert |
-| Temperatur HDD/SSD | ab `TEMP_HDD_WARN` / ab `TEMP_HDD_CRIT` | warning / alert |
-| Temperatur NVMe | ab `TEMP_NVME_WARN` / ab `TEMP_NVME_CRIT` | warning / alert |
+| Disk status | status other than `DISK_OK` | alert |
+| I/O errors | Unraid's error counter `numErrors` > 0 | alert |
+| Temperature HDD/SATA SSD | from `TEMP_HDD_WARN` / from `TEMP_HDD_CRIT` | warning / alert |
+| Temperature NVMe | from `TEMP_NVME_WARN` / from `TEMP_NVME_CRIT` | warning / alert |
 
-Leere Slots werden ignoriert: Status `DISK_NP` oder Slots ohne Gerät und ohne ID. Unraid führt einen unbelegten Parity2-Slot zum Beispiel mit `DISK_NP_DSBL`. Eine zugewiesene, aber fehlende Disk behält ihre ID in `disks.ini` und wird weiterhin gemeldet.
+Empty slots are ignored: status `DISK_NP`, or slots without device and without ID. Unraid reports an unassigned parity2 slot as `DISK_NP_DSBL`, for example. An assigned but missing disk keeps its ID in `disks.ini` and is still reported.
 
-Der Flash-Stick wird bei Temperatur und SMART übersprungen. Disks im Spindown melden keine Temperatur und werden in diesem Lauf nicht bewertet.
+The flash drive is skipped for temperature and SMART. Spun-down disks report no temperature and are not evaluated in that run.
 
 ### SMART
 
-SMART wird mit `smartctl -n standby` gelesen. **Schlafende Disks werden dadurch nicht geweckt.** Ist eine Disk im Standby, bleibt der zuletzt bekannte Zustand bestehen.
+SMART is read with `smartctl -n standby`. **Sleeping disks are not woken up.** If a disk is in standby, its last known state is kept.
 
-| Prüfung | Bedingung | Level |
+| Check | Condition | Level |
 |---|---|---|
-| Gesamtstatus | SMART-Status `FAILED` | alert |
-| Reallocated_Sector_Ct (5) | Wert gestiegen | alert |
-| Reported_Uncorrect (187) | Wert gestiegen | alert |
-| Current_Pending_Sector (197) | Wert gestiegen | alert |
-| Offline_Uncorrectable (198) | Wert gestiegen | alert |
-| UDMA_CRC_Error_Count (199) | Wert gestiegen (meist Kabel oder Backplane) | warning |
-| NVMe Media Errors | Wert gestiegen | alert |
-| NVMe Critical Warning | ungleich 0 | alert |
-| NVMe Verschleiß | `percentage_used` ≥ 90 % | warning |
+| Overall status | SMART status `FAILED` | alert |
+| Reallocated_Sector_Ct (5) | value increased | alert |
+| Reported_Uncorrect (187) | value increased | alert |
+| Current_Pending_Sector (197) | value increased | alert |
+| Offline_Uncorrectable (198) | value increased | alert |
+| UDMA_CRC_Error_Count (199) | value increased (usually cable or backplane) | warning |
+| NVMe media errors | value increased | alert |
+| NVMe critical warning | not 0 | alert |
+| NVMe wear | `percentage_used` ≥ 90 % | warning |
 
-Gemeldet wird der **Anstieg** eines Zählers gegenüber dem gespeicherten Stand. Beim ersten Lesen gibt es keinen gespeicherten Stand; ein Wert größer 0 wird dann einmalig gemeldet.
+srvmon reports an **increase** of a counter compared to the stored value. On the first read there is no stored value; a value greater than 0 is then reported once.
 
-### Speicherplatz
+### Storage space
 
-Für jeden Pfad in `SPACE_PATHS` wird die Belegung geprüft: ab `SPACE_WARN` warning, ab `SPACE_CRIT` alert. Nicht gemountete Pfade, zum Beispiel bei gestopptem Array, werden übersprungen.
+For every path in `SPACE_PATHS` the usage is checked: warning from `SPACE_WARN`, alert from `SPACE_CRIT`. Paths that are not mounted (e.g. array stopped) are skipped.
 
-Standardmäßig enthalten sind:
+Included by default:
 
-- `/mnt/user`: Array und Pools gesamt
-- `/mnt/cache`: Cache-Pool
-- `/var/log`: tmpfs, ein volles Log ist ein häufiges Unraid-Problem
-- `/var/lib/docker`: Docker-Image beziehungsweise -Verzeichnis
+- `/mnt/user`: array and pools combined
+- `/mnt/cache`: cache pool
+- `/var/log`: tmpfs; a full log is a common Unraid problem
+- `/var/lib/docker`: Docker image or directory
 
 ### Docker
 
-| Prüfung | Bedingung | Level |
+| Check | Condition | Level |
 |---|---|---|
-| Healthcheck | Container meldet `unhealthy` (gilt für alle Container) | warning |
-| Überwachte Container | Container aus `DOCKER_WATCH` läuft nicht | alert |
-| Container fehlt | Name aus `DOCKER_WATCH` existiert nicht | warning |
-| Modus `*` | Ein Container wechselt von „läuft“ zu „läuft nicht“ (einmaliges Ereignis) | warning |
+| Health check | container reports `unhealthy` (applies to all containers) | warning |
+| Watched containers | container from `DOCKER_WATCH` is not running | alert |
+| Container missing | name from `DOCKER_WATCH` does not exist | warning |
+| Mode `*` | a container changes from running to not running (one-off event) | warning |
 
 ### VMs
 
-| Prüfung | Bedingung | Level |
+| Check | Condition | Level |
 |---|---|---|
-| Absturz | VM-Zustand `crashed` (gilt für alle VMs) | alert |
-| Überwachte VMs | VM aus `VM_WATCH` läuft nicht | alert |
-| Modus `*` | Eine VM wechselt von „läuft“ zu „läuft nicht“ (einmaliges Ereignis) | warning |
+| Crash | VM state `crashed` (applies to all VMs) | alert |
+| Watched VMs | VM from `VM_WATCH` is not running | alert |
+| Mode `*` | a VM changes from running to not running (one-off event) | warning |
 
 ### System
 
-| Prüfung | Bedingung | Level |
+| Check | Condition | Level |
 |---|---|---|
-| Neustart | Neue `boot_id` seit dem letzten Lauf (einmaliges Ereignis) | warning |
-| CPU-Last | 5-Minuten-Load, bezogen auf die Anzahl logischer CPUs, ab `CPU_LOAD_WARN` % | warning |
-| RAM | Belegung (Basis `MemAvailable`) ab `RAM_WARN` % | warning |
+| Reboot | new `boot_id` since the last run (one-off event) | warning |
+| CPU load | 5-minute load relative to the number of logical CPUs, from `CPU_LOAD_WARN` % | warning |
+| RAM | usage (based on `MemAvailable`) from `RAM_WARN` % | warning |
 
-### USV (apcupsd)
+### UPS (apcupsd)
 
-| Prüfung | Bedingung | Level |
+| Check | Condition | Level |
 |---|---|---|
-| Batteriebetrieb | Status enthält `ONBATT` | alert |
-| Verbindung verloren | Status enthält `COMMLOST` | warning |
-| Batterie tauschen | Status enthält `REPLACEBATT` | warning |
+| On battery | status contains `ONBATT` | alert |
+| Connection lost | status contains `COMMLOST` | warning |
+| Replace battery | status contains `REPLACEBATT` | warning |
 
-Ist apcupsd nicht aktiv, entfällt die Prüfung.
+If apcupsd is not running, the check is skipped.
 
-### Docker-Updates
+### Docker updates
 
-| Prüfung | Bedingung | Level |
+| Check | Condition | Level |
 |---|---|---|
-| Update verfügbar | Unraids Update-Prüfung meldet für ein Image ein neueres Remote-Image (einmalig je neuem Update, mit Containernamen) | normal |
-| Container aktualisiert | Ein bestehender Container läuft mit einer neuen Image-ID bei gleicher Image-Referenz (einmaliges Ereignis, mit Version alt und neu, sofern vorhanden) | normal |
-| Image gewechselt | Ein bestehender Container nutzt eine andere Image-Referenz, zum Beispiel einen anderen Tag (einmaliges Ereignis) | normal |
+| Update available | Unraid's update check reports a newer remote image (once per new update, with container names) | normal |
+| Container updated | an existing container runs with a new image ID and the same image reference (one-off event, with old and new version if available) | normal |
+| Image changed | an existing container uses a different image reference, e.g. another tag (one-off event) | normal |
 
-**Verfügbare Updates:** srvmon fragt selbst keine Registry ab, sondern liest das Ergebnis von Unraids eigener Update-Prüfung. Wie aktuell diese Information ist, hängt deshalb von deren Zeitplan ab. Den Zeitplan für die Docker-Update-Prüfung legst du unter *Settings > Notifications* fest.
+**Available updates:** srvmon does not query registries itself but reads the result of Unraid's own update check. How current this information is depends on its schedule, which you set under *Settings > Notifications*.
 
-**Durchgeführte Updates:** srvmon merkt sich pro Container die Image-ID. Unraid erstellt einen Container bei einem Update mit dem neuen Image neu; dadurch ändert sich die Image-ID. Das erkennt srvmon unabhängig davon, wie das Update ausgelöst wurde, also auch bei automatischen Updates durch andere Plugins. Die Version stammt aus den Image-Labels, in dieser Reihenfolge: `org.opencontainers.image.version`, `version`, `build_version`. Fehlen die Labels, enthält die Meldung keine Version.
+**Performed updates:** srvmon remembers the image ID of every container. When Unraid updates a container, it recreates it with the new image, so the image ID changes. srvmon detects this regardless of how the update was triggered, including automatic updates by other plugins. The version is taken from the image labels in this order: `org.opencontainers.image.version`, `version`, `build_version`. Without these labels the notification contains no version.
 
-Nicht als Update gemeldet werden:
+Not reported as an update:
 
-- ein Neuerstellen mit unverändertem Image, zum Beispiel nach dem Ändern der Template-Einstellungen,
-- umbenannte oder neu angelegte Container (kein Vorher-Stand vorhanden),
-- Updates, die stattfinden, während srvmon nicht installiert ist.
+- recreating a container with an unchanged image, e.g. after editing the template,
+- renamed or newly created containers (no previous state),
+- updates that happen while srvmon is not installed.
 
-**Wichtig:** Alle Update-Meldungen haben das Level `normal`. Damit sie per Mail kommen, muss unter *Settings > Notifications* der E-Mail-Agent für **Notices** aktiv sein.
+**Important:** all update notifications have the level `normal`. To receive them by email, the email agent for **Notices** must be enabled under *Settings > Notifications*.
 
-Updates für Unraid OS und Plugins prüft srvmon nicht. Dafür bietet Unraid unter *Settings > Notifications* eigene Optionen.
+srvmon does not check Unraid OS or plugin updates. Unraid offers its own options for these under *Settings > Notifications*.
 
-### TLS-Zertifikate (Nginx Proxy Manager)
+### TLS certificates (Nginx Proxy Manager)
 
-srvmon prüft Zertifikate auf zwei Wegen. Beide sind unabhängig voneinander nutzbar.
+srvmon checks certificates in two independent ways.
 
-**Zertifikatsdateien:** In jedem Verzeichnis aus `CERT_DIRS` sucht srvmon nach `<verzeichnis>/*/fullchain.pem`, also der Struktur von Let's Encrypt unter `letsencrypt/live`. Bei Nginx Proxy Manager heißen die Unterverzeichnisse `npm-1`, `npm-2` und so weiter. In Meldungen erscheint statt dieser Kennung der Domainname aus dem Zertifikat.
+**Certificate files:** In every directory listed in `CERT_DIRS`, srvmon looks for `<directory>/*/fullchain.pem`, i.e. the Let's Encrypt `live` layout. Nginx Proxy Manager names the subdirectories `npm-1`, `npm-2` and so on. Notifications show the domain name from the certificate instead.
 
-**Ausgelieferte Zertifikate:** Für jeden Eintrag aus `CERT_HOSTS` baut srvmon eine TLS-Verbindung mit SNI auf und wertet das Zertifikat aus, das nginx tatsächlich ausliefert.
+**Served certificates:** For every entry in `CERT_HOSTS`, srvmon opens a TLS connection with SNI and evaluates the certificate that is actually served.
 
-| Prüfung | Bedingung | Level |
+| Check | Condition | Level |
 |---|---|---|
-| Ablauf (Datei und Live) | noch höchstens `CERT_WARN_DAYS` Tage gültig | warning |
-| Ablauf (Datei und Live) | noch höchstens `CERT_CRIT_DAYS` Tage gültig oder abgelaufen | alert |
-| Vertrauen (Live) | Kette oder Hostname ungültig, wenn `CERT_VERIFY` aktiv | warning |
-| Veraltet ausgeliefert (Live) | Im Dateisystem liegt für den Host ein Zertifikat, das mehr als einen Tag länger gültig ist als das ausgelieferte | warning |
-| Nicht erreichbar (Live) | Keine TLS-Verbindung möglich | warning |
-| Verzeichnis fehlt | Pfad aus `CERT_DIRS` existiert nicht | warning |
-| Datei nicht lesbar | `fullchain.pem` lässt sich nicht auswerten | warning |
+| Expiry (file and live) | valid for at most `CERT_WARN_DAYS` days | warning |
+| Expiry (file and live) | valid for at most `CERT_CRIT_DAYS` days, or expired | alert |
+| Trust (live) | invalid chain or hostname, if `CERT_VERIFY` is enabled | warning |
+| Outdated certificate served (live) | a certificate file for the host is valid more than one day longer than the served certificate | warning |
+| Unreachable (live) | no TLS connection possible | warning |
+| Directory missing | path from `CERT_DIRS` does not exist | warning |
+| File unreadable | `fullchain.pem` cannot be parsed | warning |
 
-**Warum beide Wege:** Let's Encrypt erneuert Zertifikate normalerweise 30 Tage vor Ablauf. Mit der Standardschwelle von 20 Tagen bedeutet eine Warnung daher, dass die Erneuerung seit mindestens 10 Tagen fehlschlägt. Der Vergleich zwischen Datei und Live-Zertifikat erkennt zusätzlich den Fall, dass die Erneuerung zwar geklappt hat, nginx das neue Zertifikat aber nicht geladen hat.
+**Why both:** Let's Encrypt normally renews certificates 30 days before expiry. With the default threshold of 20 days, a warning therefore means that renewal has been failing for at least 10 days. Comparing file and served certificate also catches the case where renewal worked but nginx has not loaded the new certificate.
 
-**Prüfrhythmus:** Zertifikate prüft srvmon höchstens einmal pro Stunde, unabhängig von `INTERVAL`. Mit `--force` lässt sich die Prüfung sofort auslösen. Bestehende Probleme bleiben zwischen den Prüfungen erhalten, inklusive Erinnerungen.
+**Superseded certificates:** When Nginx Proxy Manager recreates a certificate, it creates a new `npm-<id>` directory and the old one may remain. srvmon therefore ignores a certificate if another certificate covers all of its domains and expires later. On the status page it is shown greyed out with the note "superseded by npm-…". Certificates without a successor, e.g. for domains no longer in use, are still reported; delete them in NPM or add them to `CERT_IGNORE`.
 
-**Ersetzte Zertifikate:** Legt Nginx Proxy Manager ein Zertifikat neu an, entsteht ein neues Verzeichnis `npm-<id>`; das alte kann liegen bleiben. srvmon ignoriert deshalb ein Zertifikat, wenn ein anderes alle seine Domains abdeckt und später abläuft. Auf der Statusseite erscheint es grau mit dem Hinweis „ersetzt durch npm-…“. Zertifikate ohne Nachfolger, etwa für nicht mehr genutzte Domains, werden weiterhin gemeldet; diese in NPM löschen oder in `CERT_IGNORE` eintragen.
+**Check interval:** certificates are checked at most once per hour, independent of `INTERVAL`. `--force` triggers the check immediately. Existing problems are kept between checks, including reminders.
 
-**Hosts angeben:** mehrere Einträge kommagetrennt, ohne Port gilt 443.
+**Host notation:** several entries separated by commas; without a port, 443 is used.
 
-| Eintrag | Bedeutung |
+| Entry | Meaning |
 |---|---|
-| `cloud.example.com` | Verbindung zu cloud.example.com auf Port 443 |
-| `cloud.example.com:8443` | wie oben, Port 8443 |
-| `cloud.example.com@192.168.1.10` | Verbindung zu 192.168.1.10:443 mit SNI cloud.example.com |
-| `cloud.example.com@192.168.1.10:18443` | Verbindung zu 192.168.1.10:18443 mit SNI cloud.example.com |
+| `cloud.example.com` | connect to cloud.example.com on port 443 |
+| `cloud.example.com:8443` | as above, port 8443 |
+| `cloud.example.com@192.168.1.10` | connect to 192.168.1.10:443 with SNI cloud.example.com |
+| `cloud.example.com@192.168.1.10:8443` | connect to 192.168.1.10:8443 with SNI cloud.example.com |
 
-Die Form mit `@adresse` ist sinnvoll, wenn der Server seine öffentliche Adresse nicht selbst erreicht, etwa weil der Router kein NAT-Loopback (Hairpin-NAT) unterstützt. Die Adresse ist dann typischerweise die lokale IP des Servers mit dem Port, auf dem Nginx Proxy Manager HTTPS annimmt.
+The `@address` form is useful if the server cannot reach its own public address, e.g. because the router does not support NAT loopback (hairpin NAT). The address is then the LAN IP of the server and the host port on which Nginx Proxy Manager accepts HTTPS. `docker port <NPM container>` shows the mapping; look for the container port 443 (image `jc21/nginx-proxy-manager`) or 4443 (image `jlesage/nginx-proxy-manager`).
 
-**Pfad ermitteln:** Der Standardpfad `/mnt/user/appdata/NginxProxyManager/letsencrypt/live` passt nicht zu jedem NPM-Template. Den tatsächlichen Pfad zeigt das Volume-Mapping des Containers im Docker-Tab: Gesucht ist der Host-Pfad, der auf `/etc/letsencrypt` im Container zeigt; dort das Unterverzeichnis `live` angeben. Prüfen lässt sich der Pfad so:
+**Finding the path:** the default path `/mnt/user/appdata/NginxProxyManager/letsencrypt/live` does not match every NPM template. The volume mapping of the container in the Docker tab shows the actual path: look for the host path mapped to `/etc/letsencrypt` (or `/config/letsencrypt`) inside the container and append `live`. To check:
 
 ```bash
 ls /mnt/user/appdata/NginxProxyManager/letsencrypt/live/
 ```
 
-Eigene, in NPM hochgeladene Zertifikate (Custom Certificates) liegen in einem anderen Verzeichnis. Dieses Verzeichnis kannst du zusätzlich in `CERT_DIRS` eintragen, sofern es dieselbe Struktur `<verzeichnis>/*/fullchain.pem` hat.
+Custom certificates uploaded in NPM live in a different directory. You can add it to `CERT_DIRS` as long as it uses the same `<directory>/*/fullchain.pem` layout.
 
 ---
 
-## Benachrichtigungslogik
+## Notification logic
 
-Es gibt zwei Arten von Meldungen.
+There are two kinds of notifications.
 
-**Zustände** sind anhaltende Probleme, zum Beispiel eine hohe Temperatur oder ein voller Speicher. Sie werden gemeldet:
+**Conditions** are ongoing problems, e.g. a high temperature or a full disk. They are reported:
 
-- beim ersten Auftreten,
-- wenn das Level steigt (warning → alert),
-- als Erinnerung „Weiterhin: …“ nach `REMIND_HOURS` Stunden, solange das Problem besteht (0 = keine Erinnerung),
-- als „Behoben: …“ (Level `normal`), sobald der Zustand wieder in Ordnung ist, wenn `NOTIFY_RESOLVED` aktiv ist.
+- when they first occur,
+- when the level rises (warning → alert),
+- as a reminder "Still active: …" after `REMIND_HOURS` hours while the problem persists (0 = no reminder),
+- as "Resolved: …" (level `normal`) once the condition is back to normal, if `NOTIFY_RESOLVED` is enabled.
 
-**Ereignisse** sind einmalige Vorkommnisse, zum Beispiel ein Neustart, ein gestiegener SMART-Zähler oder ein neues Update. Sie werden genau einmal gemeldet.
+**Events** are one-off occurrences, e.g. a reboot, an increased SMART counter or a new update. They are reported exactly once.
 
-**Weitere Regeln:**
+**Further rules:**
 
-- Kann eine Prüfung keine Daten liefern, etwa weil der Docker-Dienst aus ist, bleiben bestehende Zustände unverändert. Es gibt dann weder eine „Behoben“-Meldung noch eine Erinnerung.
-- Pro Lauf werden höchstens 10 Meldungen verschickt. Sind es mehr, folgt eine Sammelmeldung „Weitere Meldungen unterdrückt“.
-- Jede Meldung wird zusätzlich mit dem Tag `srvmon` ins Syslog geschrieben.
-- Ob eine Meldung als E-Mail verschickt wird, entscheidet Unraid anhand der Agenten-Einstellungen pro Level (siehe [Installation](#installation)).
+- If a check cannot deliver data, e.g. because the Docker service is off, existing conditions remain unchanged. There is no "Resolved" notification and no reminder in that case.
+- At most 10 notifications are sent per run. If there are more, a summary "Further notifications suppressed" follows.
+- Every notification is also written to the syslog with the tag `srvmon`.
+- Whether a notification is delivered by email is decided by Unraid based on the agent settings per level (see [Installation](#installation)).
 
-Der Betreff hat die Form `srvmon: <Kurzbeschreibung>`, der Absender heißt in Unraid „Server Monitor“.
+The subject has the form `srvmon: <summary>`; the sender is shown in Unraid as "Server Monitor".
 
 ---
 
-## Weitere Benachrichtigungswege
+## Additional notification channels
 
-Zusätzlich zu Unraids Benachrichtigungen kann srvmon Meldungen per Webhook weitergeben und sich bei einer externen Ausfallüberwachung melden. Beides ist optional und standardmäßig aus.
+In addition to Unraid's notifications, srvmon can forward notifications via webhook and report to an external outage monitor. Both are optional and off by default.
 
-### Webhook (zum Beispiel Home Assistant und Alexa)
+### Webhook (e.g. Home Assistant and Alexa)
 
-Ist `WEBHOOK_URL` gesetzt, schickt srvmon jede Meldung ab dem Level `WEBHOOK_LEVEL` zusätzlich per HTTP-POST als JSON:
+If `WEBHOOK_URL` is set, srvmon additionally sends every notification from level `WEBHOOK_LEVEL` upwards as an HTTP POST with JSON:
 
 ```json
 {
   "level": "warning",
-  "subject": "Zertifikat cloud.example.com läuft in 9 Tagen ab",
-  "description": "Zertifikat für cloud.example.com (npm-2, ...) gültig bis ...",
-  "speech": "Warnung vom Server Tower: Zertifikat cloud.example.com läuft in 9 Tagen ab",
-  "host": "Tower",
+  "subject": "Certificate cloud.example.com expires in 9 days",
+  "description": "Certificate for cloud.example.com (npm-2, ...) valid until ...",
+  "speech": "Warning from server unraid: Certificate cloud.example.com expires in 9 days",
+  "host": "unraid",
   "time": 1792330214
 }
 ```
 
-Das Feld `speech` ist für Sprachausgaben gedacht: kurz, mit Level und Servername, ohne die lange Beschreibung.
+The `speech` field is meant for voice output: short, with level and server name, without the long description.
 
-Regeln:
+Rules:
 
-- Pro Lauf gehen höchstens 3 Webhook-Aufrufe raus. Gibt es mehr Meldungen, folgt ein Sammelaufruf „… weitere Meldungen“. So spricht Alexa bei einer Störung mit vielen Folgemeldungen nicht minutenlang.
-- Ist das Ziel nicht erreichbar, wird das im Syslog vermerkt (`grep srvmon /var/log/syslog`). Die Unraid-Benachrichtigung ist davon nicht betroffen.
-- Die Testmeldung (`check.php --test`) geht immer auch an den Webhook, unabhängig vom eingestellten Level.
+- At most 3 webhook calls per run. If there are more notifications, a summary call "… more notifications" follows. This keeps a voice assistant from talking for minutes during an incident with many follow-up notifications.
+- If the target is unreachable, this is logged to the syslog (`grep srvmon /var/log/syslog`). The Unraid notification is not affected.
+- The test notification (`check.php --test`) is always sent to the webhook as well, regardless of the configured level.
 
-#### Home Assistant einrichten
+#### Setting up Home Assistant
 
-1. **Alexa-Anbindung:** Home Assistant braucht eine Integration, die Alexa-Ansagen auslösen kann. Verbreitet ist die inoffizielle Integration „Alexa Media Player“ (über HACS). Sie meldet sich mit deinem Amazon-Konto an und kann durch Änderungen bei Amazon jederzeit ausfallen.
-2. **Webhook-ID erzeugen.** Die ID wirkt wie ein Passwort: Wer sie kennt, kann im lokalen Netz Ansagen auslösen. Erzeugen im Unraid-Terminal:
+1. **Alexa integration:** Home Assistant needs an integration that can trigger Alexa announcements. A common choice is the unofficial "Alexa Media Player" integration, installed via HACS. It signs in with your Amazon account and may break at any time due to changes on Amazon's side.
+2. **Create a webhook ID.** The ID acts like a password: anyone who knows it can trigger announcements from the local network. Create one in the Unraid terminal:
    ```bash
    echo "srvmon-$(openssl rand -hex 16)"
    ```
-3. **Automation anlegen** (YAML-Modus), ID und Gerätenamen anpassen:
+3. **Create an automation** (YAML mode) and adjust the ID and entity IDs:
    ```yaml
-   alias: Unraid srvmon an Alexa
+   alias: Unraid srvmon to Alexa
    mode: queued
    triggers:
      - trigger: webhook
-       webhook_id: srvmon-HIER_DIE_ERZEUGTE_ID
+       webhook_id: srvmon-YOUR_GENERATED_ID
        allowed_methods: [POST]
        local_only: true
    conditions:
-     # Alerts immer, Warnungen nur tagsüber
+     # alerts always, warnings only during the day
      - condition: template
        value_template: >
          {{ trigger.json.level == 'alert' or (7 <= now().hour < 22) }}
-   actions:
-     - action: notify.alexa_media_echo_wohnzimmer
-       data:
-         message: "{{ trigger.json.speech }}"
-         data:
-           type: announce
-   ```
-   Den genauen Namen der Aktion für dein Echo-Gerät findest du in Home Assistant unter *Entwicklerwerkzeuge > Aktionen* (Suche nach `alexa_media`).
-
-   **Mehrere Geräte:** Statt der gerätespezifischen Aktion die allgemeine Aktion `notify.alexa_media` mit einer Liste von Zielen verwenden. Die Entitätsnamen der Echo-Geräte (`media_player.…`) stehen unter *Einstellungen > Geräte & Dienste > Alexa Media Player*.
-
-   ```yaml
    actions:
      - action: notify.alexa_media
        data:
          message: "{{ trigger.json.speech }}"
          target:
-           - media_player.echo_wohnzimmer
-           - media_player.echo_buero
+           - media_player.echo_living_room
          data:
            type: announce
    ```
+   You find the entity IDs of your Echo devices (`media_player.…`) under *Settings > Devices & services > Alexa Media Player > Entities*. Under `target:` only `media_player.…` entities belong, never `notify.…`. Check under *Developer tools > Actions* that the action `notify.alexa_media` exists. The syntax `triggers`/`trigger:` and `actions`/`action:` applies to current Home Assistant versions; older versions expect `trigger:`/`platform:` and `action:`/`service:`.
 
-   **Alle Geräte:** Die Ziele per Template aus allen Mediaplayern der Integration ermitteln. Je nach Alexa-Konfiguration sind darin auch Lautsprechergruppen enthalten, was zu doppelten Ansagen führen kann; dann besser die Liste von Hand pflegen.
-
+   **All devices:** replace the `target` list with a template:
    ```yaml
          target: "{{ integration_entities('alexa_media') | select('match', 'media_player\\.') | list }}"
    ```
+   Depending on your Alexa setup, speaker groups may be included, which can lead to duplicate announcements; in that case maintain the list by hand.
 
-   **Je nach Level unterschiedlich**, zum Beispiel Alerts überall, Warnungen nur im Büro:
-
+   **Different devices per level**, e.g. alerts everywhere, warnings only in the office:
    ```yaml
-   actions:
-     - action: notify.alexa_media
-       data:
-         message: "{{ trigger.json.speech }}"
          target: >
            {% if trigger.json.level == 'alert' %}
              {{ integration_entities('alexa_media') | select('match', 'media_player\\.') | list }}
            {% else %}
-             {{ ['media_player.echo_buero'] }}
+             {{ ['media_player.echo_office'] }}
            {% endif %}
-         data:
-           type: announce
-   ``` Die Syntax `triggers`/`trigger:` und `actions`/`action:` gilt für aktuelle Home-Assistant-Versionen; ältere Versionen erwarten `trigger:`/`platform:` und `action:`/`service:`.
-4. **In srvmon eintragen:** `WEBHOOK_URL` = `http://<IP von Home Assistant>:8123/api/webhook/<ID>`, zum Beispiel `http://192.168.1.20:8123/api/webhook/srvmon-...`. Läuft Home Assistant im Netzwerk `br0` mit eigener IP, diese IP verwenden.
-5. **Testen:** `php /usr/local/emhttp/plugins/srvmon/scripts/check.php --test`
+   ```
+4. **Configure srvmon:** `WEBHOOK_URL` = `http://<Home Assistant IP>:8123/api/webhook/<ID>`, e.g. `http://192.168.1.20:8123/api/webhook/srvmon-...`. If Home Assistant runs on the `br0` network with its own IP, use that IP.
+5. **Test Home Assistant directly** from the Unraid terminal:
+   ```bash
+   curl -X POST -H 'Content-Type: application/json' \
+     -d '{"level":"warning","speech":"Test from the server"}' \
+     http://<Home Assistant IP>:8123/api/webhook/<ID>
+   ```
+6. **Test end to end:** `php /usr/local/emhttp/plugins/srvmon/scripts/check.php --test`
 
-**Grenze:** Läuft Home Assistant als Container auf demselben Unraid-Server, fällt dieser Weg zusammen mit Docker oder dem Server aus. Dafür ist der Heartbeat gedacht. Den Home-Assistant-Container selbst kannst du über `DOCKER_WATCH` überwachen; diese Meldung kommt dann per Mail oder Push, nicht über Alexa.
+**Home Assistant on `br0` with its own IP:** by default, Unraid blocks connections from the host to containers with their own IP on custom networks. srvmon runs on the host and then cannot reach Home Assistant (`curl: (7) Failed to connect`). Fix: *Settings > Docker*, set *Enable Docker* to *No*, enable *Advanced View*, set *Host access to custom networks* to *Enabled*, then set *Enable Docker* back to *Yes*. All containers stop briefly during this.
 
-### Heartbeat (Ausfall des gesamten Servers)
+**Limitation:** if Home Assistant runs as a container on the same Unraid server, this channel fails together with Docker or the server. That is what the heartbeat is for. You can watch the Home Assistant container itself via `DOCKER_WATCH`; that notification then arrives by email or push, not via Alexa.
 
-Eine Überwachung auf dem Server kann dessen Totalausfall nicht selbst melden. Deshalb ruft srvmon bei jedem Prüflauf die `HEARTBEAT_URL` auf. Ein externer Dienst schlägt Alarm, wenn diese Aufrufe ausbleiben.
+### Heartbeat (outage of the whole server)
 
-Geeignet sind zum Beispiel:
+Monitoring that runs on the server cannot report the server's own total failure. Therefore srvmon calls the `HEARTBEAT_URL` on every check run. An external service raises an alarm when these calls stop.
 
-- **healthchecks.io:** Check anlegen, als Periode das srvmon-Intervall (Standard 5 Minuten) und eine Karenzzeit von etwa 10 Minuten wählen, die Ping-URL als `HEARTBEAT_URL` eintragen. Benachrichtigen kann der Dienst per Mail, Telegram und anderen Wegen.
-- **Uptime Kuma auf einem anderen Gerät:** Monitor vom Typ „Push“ anlegen und dessen URL eintragen.
+Suitable services include:
 
-Wichtig ist, dass der externe Dienst nicht auf dem überwachten Server läuft und nicht über Home Assistant auf diesem Server benachrichtigt.
+- **healthchecks.io:** create a check, set the period to the srvmon interval (default 5 minutes) and a grace time of about 10 minutes, and enter the ping URL as `HEARTBEAT_URL`. The service can notify you by email, Telegram and other channels.
+- **Uptime Kuma on another device:** create a monitor of type "Push" and enter its URL.
+
+Make sure the external service does not run on the monitored server and does not notify via Home Assistant on that server.
 
 ---
 
-## Statusseite
+## Status page
 
-Die Seite findest du unter *Settings > User Utilities > Server Monitor Status*. Sie zeigt:
+The page is located under *Settings > User Utilities > Server Monitor Status*. It shows:
 
-- eine Zusammenfassung (Anzahl kritischer Meldungen und Warnungen oder „Alles in Ordnung“) mit dem Zeitpunkt der Live-Daten und der letzten Prüfung,
-- die aktiven Probleme mit dem Zeitpunkt ihres Auftretens,
-- System: CPU-Last, RAM und Uptime,
-- USV: Status, Ladung, Restlaufzeit und Last,
-- Speicherplatz als Balken pro Pfad,
-- Disks als Tabelle mit Status, Temperatur, Fehlern und SMART-Werten,
-- Docker und VMs mit ihrem Zustand, überwachte Einträge sind markiert; bei Containern zusätzlich ein Hinweis „Update“, die Image-Version und der Zeitpunkt des letzten erkannten Updates,
-- verfügbare Docker-Updates,
-- TLS-Zertifikate mit Quelle (Datei oder Live), Ablaufdatum, Resttagen, Aussteller und Hinweisen. Diese Daten stammen aus der letzten stündlichen Prüfung, der Zeitpunkt steht unter der Tabelle.
+- a summary (number of critical problems and warnings, or "All good") with the time of the live data and of the last check,
+- active problems with the time they occurred,
+- system: CPU load, RAM and uptime,
+- UPS: status, charge, time left and load,
+- storage space as a bar per path,
+- disks as a table with status, temperature, errors and SMART values,
+- Docker and VMs with their state, watched entries are marked; for containers additionally an "Update" hint, the image version and the time of the last detected update,
+- available Docker updates,
+- TLS certificates with source (file or live), expiry date, days left, issuer and notes. These come from the last hourly check; the time is shown below the table.
 
-Die Seite lädt ihre Daten alle 30 Sekunden neu, solange der Browser-Tab sichtbar ist. Die Farben richten sich nach den konfigurierten Schwellwerten.
+The page reloads its data every 30 seconds while the browser tab is visible. Colours follow the configured thresholds.
 
-SMART-Werte werden für die Anzeige nicht live gelesen. Die Seite zeigt den Stand der letzten Prüfung. Abgeschaltete Prüfungen erscheinen auf der Seite nicht.
+SMART values are not read live for the page; it shows the state of the last check. Disabled checks do not appear on the page.
 
-Auf der Einstellungsseite *Server Monitor* gibt es zusätzlich eine kurze Liste der aktiven Probleme.
+The settings page *Server Monitor* additionally shows a short list of active problems.
 
 ---
 
 ## Installation
 
-### Voraussetzungen
+### Requirements
 
-- Unraid 6.12 oder neuer
-- Eingerichteter Mailversand in Unraid, falls Benachrichtigungen per E-Mail kommen sollen
+- Unraid 6.12 or newer
+- For email: working mail delivery in Unraid (see below)
 
-### 1. E-Mail-Versand in Unraid einrichten
+### 1. Set up delivery in Unraid
 
-srvmon speichert keine Zugangsdaten. Der Versand läuft vollständig über Unraid.
+srvmon stores no credentials. Delivery is handled entirely by Unraid.
 
-1. Unter *Settings > Notifications* die SMTP-Einstellungen eintragen: Server, Port, Absender und Empfänger.
-2. Unter *Settings > Notifications* beim E-Mail-Agenten die gewünschten Level aktivieren:
-   - **Warnings** und **Alerts**: empfohlen
-   - **Notices**: nötig, wenn Docker-Update-Meldungen (verfügbar und durchgeführt), „Behoben“-Meldungen und Testmeldungen per Mail kommen sollen
-3. Unter *Settings > Notifications* den Zeitplan für die Docker-Update-Prüfung von Unraid aktivieren. srvmon nutzt deren Ergebnis.
-4. Mit der Testfunktion von Unraid prüfen, ob der Versand grundsätzlich funktioniert.
+1. Under *Settings > Notifications* (SMTP settings) enter the SMTP server, port, sender and recipient.
+2. Under *Settings > Notification Settings*, enable the email agent (or another agent such as Telegram, Pushover or ntfy) for the desired levels:
+   - **Warnings** and **Alerts**: recommended
+   - **Notices**: required for Docker update notifications, "Resolved" notifications and the srvmon test notification
+3. Enable the schedule for Unraid's Docker update check under *Settings > Notifications*. srvmon uses its result.
+4. Use Unraid's test function to check that delivery works in general.
 
-### 2. Plugin installieren
+**Microsoft accounts:** Microsoft has disabled or announced the end of password-based SMTP sign-in (basic authentication) and only allows OAuth2, which Unraid's SMTP settings do not support as far as known. For private Outlook.com accounts, password-based SMTP is very likely no longer available. Use a sending account with a provider that still allows SMTP with a password or app password; the recipient can still be your Microsoft address.
 
-**Empfohlen: über eine URL (mit Update-Funktion)**
+### 2. Install the plugin
 
-1. `srvmon.plg` in ein Git-Repository legen, zum Beispiel auf GitHub.
-2. In der `.plg` die Entity `pluginURL` auf die Raw-URL dieser Datei setzen:
-   ```xml
-   <!ENTITY pluginURL "https://raw.githubusercontent.com/<user>/<repo>/main/srvmon.plg">
-   ```
-3. In Unraid unter *Plugins > Install Plugin* dieselbe URL eintragen und *Install* klicken.
+**Recommended: via URL (with update function)**
 
-Danach erkennt Unraid neue Versionen über *Plugins > Check for updates*.
+In Unraid, under *Plugins > Install Plugin*, enter this URL and click *Install*:
 
-**Alternative: lokale Datei (ohne Update-Funktion)**
+```
+https://raw.githubusercontent.com/MarioKonang/unraid-srvmon/main/srvmon.plg
+```
 
-1. `srvmon.plg` auf den Flash kopieren, zum Beispiel nach `/boot/srvmon.plg`.
-2. Im Terminal ausführen:
+Unraid then detects new versions via *Plugins > Check for updates*.
+
+**Alternative: local file (without update function)**
+
+1. Copy `srvmon.plg` to the flash drive, e.g. to `/boot/srvmon.plg`.
+2. Run in the terminal:
    ```bash
    plugin install /boot/srvmon.plg
    ```
 
-### 3. Einrichtung prüfen
+### 3. Verify the setup
 
 ```bash
-# Testbenachrichtigung senden
+# send a test notification
 php /usr/local/emhttp/plugins/srvmon/scripts/check.php --test
 
-# Probelauf: zeigt, was gemeldet würde, ohne etwas zu senden
+# dry run: shows what would be reported now, without sending anything
 php /usr/local/emhttp/plugins/srvmon/scripts/check.php --force --dry-run
+
+# is the cron job active?
+grep -r srvmon /etc/cron.d/
 ```
 
-Anschließend die Einstellungen unter *Settings > User Utilities > Server Monitor* anpassen.
+Then adjust the settings under *Settings > User Utilities > Server Monitor*.
 
-### Aktualisieren
+### Updating
 
-- **Bei Installation über URL:** In der `.plg` die Entity `version` erhöhen, die Datei ins Repository hochladen und in Unraid unter *Plugins* aktualisieren. Ohne höhere Versionsnummer erkennt Unraid kein Update.
-- **Bei lokaler Installation:** Das alte Plugin entfernen und die neue Datei installieren:
+- **Installed via URL:** click *Check for updates* under *Plugins* and install the update. For developers: a new version must have a higher `version` entity in the `.plg`, otherwise Unraid does not detect an update.
+- **Installed from a local file:** remove the old plugin and install the new file:
   ```bash
   plugin remove srvmon.plg
   plugin install /boot/srvmon.plg
   ```
 
-Konfiguration und Zustand bleiben in beiden Fällen erhalten.
+Configuration and state are kept in both cases.
 
-### Deinstallieren
+### Uninstalling
 
-Über *Plugins* oder im Terminal:
+Via *Plugins* or in the terminal:
 
 ```bash
 plugin remove srvmon.plg
 ```
 
-Dabei werden der Cron-Eintrag, die Programmdateien und die temporären Dateien entfernt. Konfiguration und Zustand in `/boot/config/plugins/srvmon/` bleiben erhalten. Für eine vollständige Entfernung musst du dieses Verzeichnis anschließend manuell löschen.
+This removes the cron entry, the program files and the temporary files. Configuration and state in `/boot/config/plugins/srvmon/` are kept. Delete this directory manually for a complete removal.
 
 ---
 
-## Konfiguration
+## Configuration
 
-Die Einstellungen liegen unter *Settings > User Utilities > Server Monitor*. Die Seite ist in die Abschnitte Allgemein, Disks und SMART, Speicherplatz, Docker, VMs, System und USV sowie TLS-Zertifikate gegliedert. Sie werden in `/boot/config/plugins/srvmon/srvmon.cfg` gespeichert. Nicht gesetzte Werte übernimmt srvmon aus `default.cfg`.
+The settings are located under *Settings > User Utilities > Server Monitor*. The page is divided into the sections General, Disks and SMART, Storage space, Docker, VMs, System and UPS, TLS certificates and Additional notification channels. Settings are stored in `/boot/config/plugins/srvmon/srvmon.cfg`. Values not set there are taken from `default.cfg`.
 
-Änderungen in der Datei werden beim nächsten Lauf wirksam, ein Neustart ist nicht nötig.
+Changes to the file take effect on the next run; no restart is needed.
 
-### Allgemein
+### General
 
-| Schlüssel | Standard | Beschreibung |
+| Key | Default | Description |
 |---|---|---|
-| `INTERVAL` | `5` | Prüfintervall in Minuten (1 bis 1440) |
-| `REMIND_HOURS` | `24` | Erinnerung bei anhaltenden Problemen nach x Stunden, `0` = aus |
-| `NOTIFY_RESOLVED` | `yes` | Meldung, sobald ein Problem behoben ist |
+| `INTERVAL` | `5` | check interval in minutes (1 to 1440) |
+| `REMIND_HOURS` | `24` | reminder for ongoing problems after x hours, `0` = off |
+| `NOTIFY_RESOLVED` | `yes` | notify when a problem is resolved |
 
-### Prüfungen ein- und ausschalten
+### Enabling and disabling checks
 
-| Schlüssel | Standard | Beschreibung |
+| Key | Default | Description |
 |---|---|---|
-| `CHECK_DISKS` | `yes` | Disk-Status, E/A-Fehler, Temperatur |
-| `CHECK_SMART` | `yes` | SMART-Auswertung (nur zusammen mit `CHECK_DISKS`) |
-| `CHECK_SPACE` | `yes` | Speicherplatz |
-| `CHECK_DOCKER` | `yes` | Docker-Container |
+| `CHECK_DISKS` | `yes` | disk status, I/O errors, temperature |
+| `CHECK_SMART` | `yes` | SMART evaluation (only together with `CHECK_DISKS`) |
+| `CHECK_SPACE` | `yes` | storage space |
+| `CHECK_DOCKER` | `yes` | Docker containers |
 | `CHECK_VMS` | `yes` | VMs |
-| `CHECK_SYSTEM` | `yes` | CPU, RAM, Neustart |
-| `CHECK_UPS` | `yes` | USV über apcupsd |
-| `CHECK_UPDATES` | `yes` | Verfügbare Docker-Updates melden |
-| `CHECK_DOCKER_UPDATED` | `yes` | Durchgeführte Container-Updates melden (nur zusammen mit `CHECK_DOCKER`) |
+| `CHECK_SYSTEM` | `yes` | CPU, RAM, reboot |
+| `CHECK_UPS` | `yes` | UPS via apcupsd |
+| `CHECK_UPDATES` | `yes` | notify about available Docker updates |
+| `CHECK_DOCKER_UPDATED` | `yes` | notify about performed container updates (only together with `CHECK_DOCKER`) |
 
-### TLS-Zertifikate
+### TLS certificates
 
-| Schlüssel | Standard | Beschreibung |
+| Key | Default | Description |
 |---|---|---|
-| `CHECK_CERTS` | `yes` | Zertifikatsprüfung ein/aus |
-| `CERT_DIRS` | `/mnt/user/appdata/NginxProxyManager/letsencrypt/live` | Verzeichnisse mit `*/fullchain.pem`, kommagetrennt; leer = Dateiprüfung aus |
-| `CERT_HOSTS` | leer | Live zu prüfende Hosts, Format `host`, `host:port`, `host@adresse` oder `host@adresse:port`; leer = Live-Prüfung aus |
-| `CERT_WARN_DAYS` | `20` | Warnung, wenn höchstens so viele Tage Restlaufzeit |
-| `CERT_CRIT_DAYS` | `7` | Alarm, wenn höchstens so viele Tage Restlaufzeit |
-| `CERT_VERIFY` | `yes` | Vertrauenskette und Hostname bei der Live-Prüfung prüfen |
-| `CERT_IGNORE` | leer | Domains, deren Zertifikatsdateien ignoriert werden, kommagetrennt |
+| `CHECK_CERTS` | `yes` | certificate check on/off |
+| `CERT_DIRS` | `/mnt/user/appdata/NginxProxyManager/letsencrypt/live` | directories containing `*/fullchain.pem`, comma-separated; empty = file check off |
+| `CERT_HOSTS` | empty | hosts to check live: `host`, `host:port`, `host@address` or `host@address:port`; empty = live check off |
+| `CERT_WARN_DAYS` | `20` | warning at this many days left or fewer |
+| `CERT_CRIT_DAYS` | `7` | alert at this many days left or fewer |
+| `CERT_VERIFY` | `yes` | verify trust chain and hostname in the live check |
+| `CERT_IGNORE` | empty | domains whose certificate files are ignored, comma-separated |
 
-### Schwellwerte
+### Additional notification channels
 
-| Schlüssel | Standard | Beschreibung |
+| Key | Default | Description |
 |---|---|---|
-| `TEMP_HDD_WARN` | `45` | °C, Warnung für HDD/SATA-SSD |
-| `TEMP_HDD_CRIT` | `50` | °C, Alarm für HDD/SATA-SSD |
-| `TEMP_NVME_WARN` | `60` | °C, Warnung für NVMe |
-| `TEMP_NVME_CRIT` | `70` | °C, Alarm für NVMe |
-| `SPACE_WARN` | `85` | % Belegung, Warnung |
-| `SPACE_CRIT` | `95` | % Belegung, Alarm |
-| `CPU_LOAD_WARN` | `90` | % des 5-Minuten-Loads, bezogen auf die Anzahl logischer CPUs |
-| `RAM_WARN` | `90` | % RAM-Belegung |
+| `WEBHOOK_URL` | empty | target for webhook calls (HTTP POST with JSON); empty = off |
+| `WEBHOOK_LEVEL` | `warning` | minimum level for webhooks: `normal` (everything), `warning` (warnings and alerts) or `alert` |
+| `HEARTBEAT_URL` | empty | called via GET on every check run; empty = off |
 
-### Weitere Benachrichtigungswege
+### Thresholds
 
-| Schlüssel | Standard | Beschreibung |
+| Key | Default | Description |
 |---|---|---|
-| `WEBHOOK_URL` | leer | Ziel für Webhook-Aufrufe (HTTP-POST mit JSON); leer = aus |
-| `WEBHOOK_LEVEL` | `warning` | Mindest-Level für Webhooks: `normal` (alles), `warning` (Warnings und Alerts) oder `alert` |
-| `HEARTBEAT_URL` | leer | Wird bei jedem Prüflauf per GET aufgerufen; leer = aus |
+| `TEMP_HDD_WARN` | `45` | °C, warning for HDD/SATA SSD |
+| `TEMP_HDD_CRIT` | `50` | °C, alert for HDD/SATA SSD |
+| `TEMP_NVME_WARN` | `60` | °C, warning for NVMe |
+| `TEMP_NVME_CRIT` | `70` | °C, alert for NVMe |
+| `SPACE_WARN` | `85` | % usage, warning |
+| `SPACE_CRIT` | `95` | % usage, alert |
+| `CPU_LOAD_WARN` | `90` | % of the 5-minute load relative to the number of logical CPUs |
+| `RAM_WARN` | `90` | % RAM usage |
 
-### Pfade und Watchlists
+### Paths and watch lists
 
-| Schlüssel | Standard | Beschreibung |
+| Key | Default | Description |
 |---|---|---|
-| `SPACE_PATHS` | `/mnt/user,/mnt/cache,/var/log,/var/lib/docker` | Zu prüfende Mountpoints, kommagetrennt |
-| `DOCKER_WATCH` | `*` | Überwachte Container (siehe unten) |
-| `VM_WATCH` | leer | Überwachte VMs (siehe unten) |
+| `SPACE_PATHS` | `/mnt/user,/mnt/cache,/var/log,/var/lib/docker` | mount points to check, comma-separated |
+| `DOCKER_WATCH` | `*` | watched containers (see below) |
+| `VM_WATCH` | empty | watched VMs (see below) |
 
-### Watchlists im Detail
+### Watch lists in detail
 
-`DOCKER_WATCH` und `VM_WATCH` kennen drei Modi:
+`DOCKER_WATCH` and `VM_WATCH` support three modes:
 
-| Wert | Verhalten |
+| Value | Behaviour |
 |---|---|
-| leer | Keine gezielte Überwachung. Es gelten nur die allgemeinen Prüfungen: `unhealthy` bei Containern, `crashed` bei VMs. |
-| `name1,name2` | Solange ein genannter Eintrag nicht läuft, besteht ein Alarm, inklusive Erinnerungen. |
-| `*` | Jeder Wechsel von „läuft“ zu „läuft nicht“ wird einmalig gemeldet, auch bei manuellem Stopp. |
+| empty | no targeted monitoring; only the general checks apply: `unhealthy` for containers, `crashed` for VMs |
+| `name1,name2` | as long as a listed entry is not running, an alert is active, including reminders |
+| `*` | every change from running to not running is reported once, including manual stops |
 
-Hinweise:
+Notes:
 
-- Namen müssen exakt stimmen, Groß- und Kleinschreibung zählt. Die korrekten Namen zeigen diese Befehle:
+- Names must match exactly; case matters. These commands show the correct names:
   ```bash
   docker ps -a --format '{{.Names}}'
   virsh list --all --name
   ```
-- `*` nicht mit Namen mischen. Ist `*` enthalten, werden die Namen ignoriert.
-- Namen mit Komma sind nicht möglich, weil das Komma das Trennzeichen ist.
-- Bei Docker meldet srvmon nicht existierende Namen. Bei VMs gibt es diese Prüfung nicht.
+- Do not mix `*` with names. If `*` is present, names are ignored.
+- Names containing a comma are not possible, as the comma is the separator.
+- For Docker, srvmon reports names that do not exist. VMs have no such check.
 
-### Beispiel `srvmon.cfg`
+### Example `srvmon.cfg`
 
 ```ini
 INTERVAL="5"
@@ -504,193 +499,211 @@ VM_WATCH="HomeAssistant"
 RAM_WARN="95"
 REMIND_HOURS="12"
 CERT_HOSTS="cloud.example.com@192.168.1.10,app.example.com@192.168.1.10"
+CERT_IGNORE="old.example.com"
 ```
 
 ---
 
-## Kommandozeile
+## Command line
 
 ```bash
-php /usr/local/emhttp/plugins/srvmon/scripts/check.php [Optionen]
+php /usr/local/emhttp/plugins/srvmon/scripts/check.php [options]
 ```
 
-| Option | Wirkung |
+| Option | Effect |
 |---|---|
-| ohne | Normaler Lauf, wird aber übersprungen, wenn das Intervall noch nicht abgelaufen ist |
-| `--force` | Intervall ignorieren und sofort prüfen |
-| `--dry-run` | Meldungen nur auf der Konsole ausgeben; nichts senden, keinen Zustand speichern |
-| `--test` | Testbenachrichtigung senden |
+| none | normal run; skipped if the interval has not elapsed yet |
+| `--force` | ignore the interval (and the hourly certificate limit) and check immediately |
+| `--dry-run` | print notifications to the console only; send nothing, save no state |
+| `--test` | send a test notification (also to the webhook) |
 
-Der Cron-Job ruft das Skript jede Minute auf, das Skript selbst prüft das Intervall. Ein Lock verhindert parallele Läufe.
+Note: `--dry-run` only shows what would be sent **in this run**. Problems already stored in the state are not repeated. The status page shows the complete current state.
+
+The cron job calls the script every minute; the script checks the interval itself. A lock prevents parallel runs.
 
 ---
 
-## Dateien und Pfade
+## Files and paths
 
-### Programmdateien (RAM, werden beim Booten aus der `.plg` neu erzeugt)
+### Program files (RAM, recreated from the `.plg` on boot)
 
-| Pfad | Inhalt |
+| Path | Content |
 |---|---|
-| `/usr/local/emhttp/plugins/srvmon/README.md` | Kurzbeschreibung für die Pluginliste |
-| `/usr/local/emhttp/plugins/srvmon/default.cfg` | Standardwerte |
-| `/usr/local/emhttp/plugins/srvmon/include/lib.php` | Gemeinsame Funktionen und Datensammler |
-| `/usr/local/emhttp/plugins/srvmon/include/data.php` | JSON-Endpunkt für die Statusseite |
-| `/usr/local/emhttp/plugins/srvmon/scripts/check.php` | Prüfskript |
-| `/usr/local/emhttp/plugins/srvmon/srvmon.page` | Einstellungsseite |
-| `/usr/local/emhttp/plugins/srvmon/SrvmonStatus.page` | Statusseite |
+| `/usr/local/emhttp/plugins/srvmon/README.md` | short description for the plugin list |
+| `/usr/local/emhttp/plugins/srvmon/default.cfg` | default values |
+| `/usr/local/emhttp/plugins/srvmon/include/lib.php` | shared functions and data collectors |
+| `/usr/local/emhttp/plugins/srvmon/include/data.php` | JSON endpoint for the status page |
+| `/usr/local/emhttp/plugins/srvmon/scripts/check.php` | check script |
+| `/usr/local/emhttp/plugins/srvmon/srvmon.page` | settings page |
+| `/usr/local/emhttp/plugins/srvmon/SrvmonStatus.page` | status page |
 
-### Persistente Dateien (Flash)
+### Persistent files (flash)
 
-| Pfad | Inhalt |
+| Path | Content |
 |---|---|
-| `/boot/config/plugins/srvmon.plg` | Plugin-Definition, wird von Unraid beim Booten installiert |
-| `/boot/config/plugins/srvmon/srvmon.cfg` | Deine Einstellungen |
-| `/boot/config/plugins/srvmon/srvmon.cron` | Cron-Eintrag |
-| `/boot/config/plugins/srvmon/state.json` | Aktive Probleme, SMART-Stand, letzte Zustände von Containern und VMs, Image-ID und Version pro Container, bekannte Updates |
+| `/boot/config/plugins/srvmon.plg` | plugin definition, installed by Unraid on boot |
+| `/boot/config/plugins/srvmon/srvmon.cfg` | your settings |
+| `/boot/config/plugins/srvmon/srvmon.cron` | cron entry |
+| `/boot/config/plugins/srvmon/state.json` | active problems, SMART baseline, last known container and VM states, image ID and version per container, known updates |
 
-`state.json` wird nur geschrieben, wenn sich der Inhalt tatsächlich ändert. Das schont den Flash-Stick.
+`state.json` is only written when its content actually changes, to spare the flash drive.
 
-### Temporäre Dateien (RAM)
+### Temporary files (RAM)
 
-| Pfad | Inhalt |
+| Path | Content |
 |---|---|
-| `/tmp/srvmon/lastrun` | Zeitpunkt des letzten Laufs |
-| `/tmp/srvmon/lock` | Sperre gegen parallele Läufe |
-| `/tmp/srvmon/status.json` | Status des letzten Laufs für die WebGUI |
-| `/tmp/srvmon/lastcert` | Zeitpunkt der letzten Zertifikatsprüfung |
-| `/tmp/srvmon/certs.json` | Ergebnis der letzten Zertifikatsprüfung für die Statusseite |
+| `/tmp/srvmon/lastrun` | time of the last run |
+| `/tmp/srvmon/lock` | lock against parallel runs |
+| `/tmp/srvmon/status.json` | status of the last run for the WebGUI |
+| `/tmp/srvmon/lastcert` | time of the last certificate check |
+| `/tmp/srvmon/certs.json` | result of the last certificate check for the status page |
 
 ---
 
-## Datenquellen
+## Data sources
 
-| Bereich | Quelle |
+| Area | Source |
 |---|---|
 | Disks | `/var/local/emhttp/disks.ini` |
-| SMART | `smartctl -n standby -j -H -A /dev/<gerät>` |
-| Speicherplatz | `mountpoint -q` sowie die PHP-Funktionen `disk_total_space` und `disk_free_space` |
-| Docker | `docker ps -a`, `docker inspect` (Image-ID, Image-Referenz, Labels) |
+| SMART | `smartctl -n standby -j -H -A /dev/<device>` |
+| Storage space | `mountpoint -q` and the PHP functions `disk_total_space` and `disk_free_space` |
+| Docker | `docker ps -a`, `docker inspect` (image ID, image reference, labels) |
 | VMs | `virsh list --all --name`, `virsh domstate` |
-| CPU, RAM, Uptime | `/proc/loadavg`, `/proc/meminfo`, `/proc/uptime`, `nproc` |
-| Neustart | `/proc/sys/kernel/random/boot_id` |
-| USV | `apcaccess status` |
-| Zertifikatsdateien | `openssl x509` auf `<CERT_DIRS>/*/fullchain.pem` |
-| Ausgelieferte Zertifikate | `openssl s_client` mit SNI und `-verify_hostname` |
-| Docker-Updates | `/var/lib/docker/unraid-update-status.json` |
-| Versand | `/usr/local/emhttp/webGui/scripts/notify` |
+| CPU, RAM, uptime | `/proc/loadavg`, `/proc/meminfo`, `/proc/uptime`, `nproc` |
+| Reboot | `/proc/sys/kernel/random/boot_id` |
+| UPS | `apcaccess status` |
+| Docker updates | `/var/lib/docker/unraid-update-status.json` |
+| Certificate files | `openssl x509` on `<CERT_DIRS>/*/fullchain.pem` |
+| Served certificates | `openssl s_client` with SNI and `-verify_hostname` |
+| Delivery | `/usr/local/emhttp/webGui/scripts/notify`, `curl` for webhook and heartbeat |
 
-Alle externen Aufrufe laufen mit `timeout`, damit ein hängender Dienst den Lauf nicht blockiert.
-
----
-
-## Sicherheit
-
-- **Keine Zugangsdaten im Plugin.** Der Mailversand nutzt die SMTP-Konfiguration von Unraid.
-- **Schreibzugriff nur bei Bedarf.** Das Plugin schreibt außer in die eigenen Pfade nichts auf den Server; die externen Befehle werden nur lesend aufgerufen.
-- **Statusseite hinter dem Login.** Der JSON-Endpunkt liegt im Plugin-Verzeichnis der WebGUI und ist damit durch den WebGUI-Login geschützt. Disk-IDs, die meist Seriennummern enthalten, gibt er nicht an den Browser aus.
-- **Root-Rechte.** Plugins laufen mit Root-Rechten. Installiere nur aus Quellen, die du kontrollierst. Wer Schreibzugriff auf das Repository hinter `pluginURL` hat, kann über ein Update beliebigen Code auf dem Server ausführen.
-- **Webhook-ID und Heartbeat-URL sind Geheimnisse.** Sie stehen in `srvmon.cfg` auf dem Flash, nicht in der `.plg`. Die Konfigurationsdatei deshalb nicht veröffentlichen. Bei Home Assistant `local_only: true` beibehalten, damit der Webhook nur aus dem lokalen Netz auslösbar ist.
-- **Daten an Dritte.** Über Webhooks und Heartbeat verlassen Daten den Server: beim Webhook die Meldungstexte, beim Heartbeat nur der Aufruf selbst. Bei externen Diensten wie healthchecks.io bleibt es beim Heartbeat ohne Inhalt.
-- **Keine Tokens in der URL.** Bei privaten Repositories gehört kein Zugriffstoken in `pluginURL`, denn es stünde im Klartext auf dem Flash und im Log.
+All external calls run with `timeout`, so a hanging service does not block the run.
 
 ---
 
-## Bekannte Grenzen
+## Security
 
-- **`DOCKER_WATCH="*"`** meldet auch manuelle Stopps und Stopps durch Backup-Plugins. Für weniger Meldungen nur konkrete Namen eintragen.
-- **ZFS:** Der ARC zählt als belegter RAM. Auf ZFS-Systemen `RAM_WARN` höher setzen.
-- **SMART hinter manchen Controllern:** Disks, die bei `smartctl` einen `-d`-Typ benötigen, liefern keine SMART-Daten. Unraids eigene SMART-Einstellung pro Disk wird nicht ausgewertet.
-- **Fehlende Disks:** Dass eine zugewiesene, aber fehlende Disk ihre ID in `disks.ini` behält, ist eine Annahme und wurde nicht auf einem echten System geprüft.
-- **Disk-Status:** Alle Werte außer `DISK_OK` lösen bei belegten Slots einen Alarm aus, also auch Übergangszustände wie beim Hinzufügen einer neuen Disk.
-- **`/mnt/user`:** Die Belegung ist ein Gesamtwert über Array und Pools. Für einzelne Disks die Pfade `/mnt/diskN` in `SPACE_PATHS` ergänzen.
-- **CPU-Temperatur** wird nicht überwacht, weil die Sensorkonfiguration je nach Hardware stark variiert.
-- **Unraid OS- und Plugin-Updates** prüft srvmon nicht; dafür gibt es die Optionen in Unraid.
-- **Update-Hinweis auf der Statusseite:** Nach einem Update kann der Hinweis „Update“ stehen bleiben, bis Unraids eigene Update-Prüfung das nächste Mal läuft.
-- **Zuordnung Image zu Container:** Image-Referenzen ohne Tag werden als `:latest` behandelt. Bei abweichenden Schreibweisen derselben Registry, etwa mit und ohne `docker.io/`, kann die Zuordnung fehlschlagen; die Meldung nennt dann nur das Image.
-- **Verwaiste Zertifikate:** srvmon liest die NPM-Datenbank nicht und weiß daher nicht, welche Zertifikate NPM tatsächlich nutzt. Ersetzte Zertifikate werden erkannt (siehe oben); Zertifikate nicht mehr genutzter Domains ohne Nachfolger werden weiterhin gemeldet. Solche Domains in `CERT_IGNORE` eintragen oder die Zertifikate in NPM löschen.
-- **Vertrauensprüfung:** Sie nutzt die CA-Zertifikate des Unraid-Systems. Fehlen diese, meldet die Prüfung auch gültige Let's-Encrypt-Zertifikate als nicht vertrauenswürdig. In dem Fall `CERT_VERIFY="no"` setzen.
-- **Array-Disks:** Liegt appdata auf dem Array statt auf einem Pool, kann die stündliche Dateiprüfung eine schlafende Disk wecken.
-- **Erkennungsverzögerung:** Die Auflösung entspricht dem Prüfintervall. Ein Problem, das zwischen zwei Läufen auftritt und wieder verschwindet, wird nicht erkannt.
+- **No credentials in the plugin.** Email delivery uses Unraid's SMTP configuration.
+- **Read-only checks.** Apart from its own paths, srvmon writes nothing to the server; external commands are only called for reading.
+- **Status page behind the login.** The JSON endpoint lives in the plugin directory of the WebGUI and is therefore protected by the WebGUI login. It does not send disk IDs, which usually contain serial numbers, to the browser.
+- **Webhook ID and heartbeat URL are secrets.** They are stored in `srvmon.cfg` on the flash drive, not in the `.plg`. Do not publish the configuration file. In Home Assistant keep `local_only: true` so the webhook can only be triggered from the local network.
+- **Data leaving the server.** Webhook calls contain the notification texts; the heartbeat only consists of the call itself.
+- **Root privileges.** Plugins run as root. Only install from sources you control. Anyone with write access to the repository behind `pluginURL` can run arbitrary code on the server through an update. Protect the GitHub account with two-factor authentication.
+- **No tokens in the URL.** For private repositories, do not put an access token into `pluginURL`; it would be stored in plain text on the flash drive and in the log.
+- **WebGUI over HTTP.** If the Unraid WebGUI is only reachable via HTTP, the root password travels unencrypted when logging in. Unraid offers HTTPS under *Settings > Management Access*.
 
 ---
 
-## Ungeprüfte Annahmen
+## Known limitations
 
-srvmon wurde mit simulierten Unraid-Dateien und Tools getestet, nicht auf einem echten Unraid 7.2.3. Diese Punkte solltest du auf deinem System prüfen:
+- **`DOCKER_WATCH="*"`** also reports manual stops and stops by backup plugins. For fewer notifications, list specific names instead.
+- **ZFS:** the ARC counts as used RAM. On ZFS systems, set `RAM_WARN` higher.
+- **SMART behind some controllers:** disks that require a `-d` type for `smartctl` provide no SMART data. Unraid's own per-disk SMART setting is not evaluated.
+- **Disk status:** for assigned slots, every value other than `DISK_OK` raises an alert, including transitional states such as adding a new disk.
+- **Missing disks:** that an assigned but missing disk keeps its ID in `disks.ini` is an assumption and has not been tested on a real system.
+- **`/mnt/user`:** usage is a combined value across array and pools. For individual disks, add the paths `/mnt/diskN` to `SPACE_PATHS`.
+- **CPU temperature** is not monitored, because the sensor configuration varies a lot between hardware.
+- **Unraid OS and plugin updates** are not checked by srvmon; Unraid has its own options for this.
+- **Update hint on the status page:** after an update, the "Update" hint may remain until Unraid's own update check runs again.
+- **Image to container mapping:** image references without a tag are treated as `:latest`. With different spellings of the same registry (e.g. with and without `docker.io/`), the mapping may fail; the notification then names only the image.
+- **Orphaned certificates:** srvmon does not read the NPM database and therefore does not know which certificates NPM actually uses. Superseded certificates are detected (see above); certificates of unused domains without a successor are still reported.
+- **Trust verification:** it uses the CA certificates of the Unraid system. If they are missing, valid Let's Encrypt certificates are also reported as untrusted. In that case set `CERT_VERIFY="no"`.
+- **Array disks:** if appdata is on the array instead of a pool, the hourly file check may wake a sleeping disk.
+- **Detection delay:** resolution equals the check interval. A problem that appears and disappears between two runs is not detected.
 
-| Annahme | Prüfung |
+---
+
+## Verification status
+
+srvmon was developed and tested with simulated Unraid files and tools and has since been used on Unraid 7.2.3.
+
+**Confirmed on Unraid 7.2.3:**
+
+- installation via `plugin install`, plugin list entry
+- cron entry via `update_cron` (fix for the missing entry after installation is included since 2026.10.18e)
+- reading `disks.ini`, including the empty parity2 slot with `DISK_NP_DSBL`
+- saving settings via `/update.php`
+- status page rendering
+- certificate files of Nginx Proxy Manager (image `jlesage`), detection of superseded certificates
+- live check with `openssl s_client`, including trust verification with the system's CA certificates
+- webhook to Home Assistant and Alexa announcement
+
+**Not yet confirmed:**
+
+| Assumption | How to check |
 |---|---|
-| `notify`, `update_cron` und PHP-CLI sind an den erwarteten Pfaden vorhanden | `ls -l /usr/local/emhttp/webGui/scripts/notify /usr/local/sbin/update_cron /usr/bin/php` |
-| Schlüssel und Statuswerte in `disks.ini` | `grep -E '^\[\|^(status\|temp\|numErrors\|type\|device)=' /var/local/emhttp/disks.ini` |
-| Format der Docker-Update-Datei (Felder `local` und `remote`) | `head -c 500 /var/lib/docker/unraid-update-status.json` |
-| Pfad der NPM-Zertifikate | `ls <CERT_DIRS>` muss Unterverzeichnisse wie `npm-1` mit `fullchain.pem` zeigen |
-| `openssl` mit `-ext` und `-verify_hostname` (OpenSSL 1.1.1 oder neuer) | `openssl version` |
-| CA-Zertifikate für die Vertrauensprüfung vorhanden | `echo \| openssl s_client -connect letsencrypt.org:443 -servername letsencrypt.org 2>/dev/null \| grep "Verify return code"` muss `0 (ok)` zeigen |
-| Docker wandelt `\t` im `--format`-Template in Tabulatoren um | `docker inspect --format '{{.Name}}\t{{.Image}}' $(docker ps -aq)` muss tabulatorgetrennte Zeilen liefern |
-| Speichern der Einstellungen über `/update.php` mit CSRF-Token | Wert in der GUI ändern, dann `cat /boot/config/plugins/srvmon/srvmon.cfg` |
-| Plugin-Attribute `icon="heartbeat"` und `launch="Settings/srvmon"` werden in der Pluginliste ausgewertet | Pluginliste ansehen: Icon und anklickbarer Name |
-| Header `Markdown="false"` in der Statusseite wird unterstützt | Statusseite öffnen und auf Darstellungsfehler prüfen |
-| Darstellung im responsiven Layout von 7.2.x | Beide Seiten auf Desktop und Smartphone öffnen |
-
-Die Ausgabe von `disks.ini` enthält keine Seriennummern, wenn du den Befehl wie angegeben verwendest. Prüfe trotzdem jede Ausgabe, bevor du sie weitergibst.
+| cron entry is present after a reboot without manual action | after a reboot: `date -d @$(cat /tmp/srvmon/lastrun)` |
+| format of the Docker update file (fields `local` and `remote`) | `head -c 500 /var/lib/docker/unraid-update-status.json` |
+| Docker converts `\t` in `--format` templates to tabs | `docker inspect --format '{{.Name}}\t{{.Image}}' $(docker ps -aq)` must print tab-separated lines |
+| plugin attributes `icon`, `launch` and `support` are evaluated in the plugin list | check the plugin list: icon, clickable name, support link |
+| header `Markdown="false"` on the status page | open the status page and check for rendering errors |
 
 ---
 
-## Fehlersuche
+## Troubleshooting
 
-| Problem | Vorgehen |
+| Problem | What to do |
 |---|---|
-| Keine Mails | `check.php --test` ausführen. Erscheint die Meldung in der Unraid-Glocke, aber nicht als Mail, sind SMTP oder der E-Mail-Agent unter *Settings > Notifications* das Problem. |
-| Keine Alexa-Ansage | `check.php --test` ausführen; in Home Assistant unter *Einstellungen > Automationen* die Ablaufverfolgung (Trace) der Automation prüfen; im Unraid-Syslog nach „Webhook fehlgeschlagen“ suchen |
-| Meldungen nachvollziehen | `grep srvmon /var/log/syslog` |
-| Was würde gemeldet? | `check.php --force --dry-run` |
-| Läuft der Cron-Job? | `date -d @$(cat /tmp/srvmon/lastrun)` muss einen Zeitpunkt innerhalb des Intervalls zeigen, `grep -r srvmon /etc/cron.d/` den Eintrag mit `check.php` |
-| Cron-Eintrag fehlt | `/usr/local/sbin/update_cron` ausführen und erneut prüfen. Ab Version 2026.10.18e liest das Installationsskript den Eintrag 15 Sekunden nach der Installation automatisch nochmals ein. |
-| Einstellungen werden nicht gespeichert | `cat /boot/config/plugins/srvmon/srvmon.cfg` prüfen, Browser-Konsole auf Fehler prüfen |
-| Statusseite zeigt „Daten konnten nicht geladen werden“ | `php /usr/local/emhttp/plugins/srvmon/include/data.php` im Terminal ausführen und die Ausgabe auf PHP-Fehler prüfen |
-| Zertifikatsprüfung sofort ausführen | `check.php --force --dry-run` (umgeht auch die stündliche Sperre) |
-| Alte Meldungen hängen fest | Zustand zurücksetzen: `rm /boot/config/plugins/srvmon/state.json`. Danach werden bestehende Probleme erneut gemeldet und SMART-Zähler > 0 einmalig wiederholt. |
+| No email | run `check.php --test`. If the notification appears in Unraid's bell but not as an email, SMTP or the email agent under *Settings > Notifications* is the problem. |
+| No Alexa announcement | run `check.php --test`; in Home Assistant check the automation's trace (*Settings > Automations*, three-dot menu, *Traces*); search the Unraid syslog for "Webhook failed" |
+| `curl: (7) Failed to connect` to Home Assistant | Home Assistant runs with its own IP on `br0`; enable *Host access to custom networks* (see [Webhook](#webhook-eg-home-assistant-and-alexa)) |
+| Trace notifications | `grep srvmon /var/log/syslog` |
+| What would be reported? | `check.php --force --dry-run` (shows only new notifications, see [Command line](#command-line)) |
+| Is the cron job running? | `date -d @$(cat /tmp/srvmon/lastrun)` must show a time within the interval, `grep -r srvmon /etc/cron.d/` the entry with `check.php` |
+| Cron entry missing | run `/usr/local/sbin/update_cron` and check again |
+| Settings are not saved | check `cat /boot/config/plugins/srvmon/srvmon.cfg` and the browser console |
+| Status page shows "Could not load data" | run `php /usr/local/emhttp/plugins/srvmon/include/data.php` in the terminal and check the output for PHP errors |
+| Run the certificate check now | `check.php --force --dry-run` (also bypasses the hourly limit) |
+| TLS check fails with "No TLS connection" | use the notation `host@<LAN-IP>:<NPM HTTPS port>`, see [TLS certificates](#tls-certificates-nginx-proxy-manager) |
+| Stale notifications stick | reset the state: `rm /boot/config/plugins/srvmon/state.json`. Existing problems are then reported again and SMART counters > 0 are repeated once. |
 
 ---
 
-## Änderungen
+## Changelog
+
+### 2026.10.18k
+- All texts (user interface, notifications, documentation) translated to English
+- Dates shown in ISO format (YYYY-MM-DD)
+
+### 2026.10.18j
+- Published on GitHub, updates via the Plugins tab
 
 ### 2026.10.18i
-- Webhook-Versand, zum Beispiel an Home Assistant für Alexa-Ansagen; Mindest-Level einstellbar, höchstens 3 Aufrufe pro Lauf plus Sammelmeldung
-- Heartbeat-URL für eine externe Ausfallüberwachung (healthchecks.io, Uptime Kuma)
+- Webhook delivery, e.g. to Home Assistant for Alexa announcements; minimum level configurable, at most 3 calls per run plus summary
+- Heartbeat URL for external outage monitoring (healthchecks.io, Uptime Kuma)
 
 ### 2026.10.18h
-- Einstellungsseite in Abschnitte mit Trennlinien gegliedert, Felder thematisch sortiert
+- Settings page grouped into sections with separators, fields sorted by topic
 
 ### 2026.10.18g
-- Zertifikatsdateien, die durch ein neueres Zertifikat für dieselben Domains ersetzt wurden, werden ignoriert
-- `CERT_HOSTS` akzeptiert den Port auch hinter der Adresse (`host@adresse:port`)
-- Hinweis auf die Schreibweise mit LAN-Adresse, wenn die Live-Prüfung keine Verbindung bekommt
+- Certificate files superseded by a newer certificate for the same domains are ignored
+- `CERT_HOSTS` also accepts the port after the address (`host@address:port`)
+- Hint about the LAN address notation when the live check cannot connect
 
 ### 2026.10.18f
-- Leere Disk-Slots ohne Gerät und ID werden ignoriert. Behebt den Fehlalarm bei einem leeren Parity2-Slot mit `DISK_NP_DSBL`.
+- Empty disk slots without device and ID are ignored; fixes the false alarm for an empty parity2 slot with `DISK_NP_DSBL`
 
 ### 2026.10.18e
-- Cron-Eintrag wird nach Abschluss der Installation erneut eingelesen. Ursache des Fehlers: `update_cron` berücksichtigt nur bereits registrierte Plugins, srvmon ist während des eigenen Installationsskripts aber noch nicht registriert.
-- Icon, Beschreibung und Link zur Einstellungsseite in der Pluginliste
+- Cron entry is reloaded after the installation has finished. Cause of the bug: `update_cron` only includes plugins that are already registered, but srvmon is not registered yet while its own install script runs.
+- Icon, description and link to the settings page in the plugin list
 
 ### 2026.10.18d
-- TLS-Zertifikate: Ablauf der Zertifikatsdateien (Nginx Proxy Manager) und der live ausgelieferten Zertifikate
-- Erkennung, wenn nginx nach einer Erneuerung noch das alte Zertifikat ausliefert
-- Prüfung von Vertrauenskette und Hostname, Statusseite mit Zertifikatsübersicht
+- TLS certificates: expiry of certificate files (Nginx Proxy Manager) and of live served certificates
+- Detection of nginx still serving the old certificate after a renewal
+- Trust chain and hostname verification, certificate overview on the status page
 
 ### 2026.10.18c
-- Meldung, wenn ein Container mit einem neuen Image gestartet wurde, inklusive Version aus den Image-Labels
-- Meldung zu verfügbaren Updates nennt die betroffenen Container
-- Statusseite: Update-Hinweis, Version und Zeitpunkt des letzten Updates pro Container
-- Neue Option `CHECK_DOCKER_UPDATED`
+- Notification when a container was started with a new image, including the version from the image labels
+- Notification about available updates names the affected containers
+- Status page: update hint, version and time of the last update per container
+- New option `CHECK_DOCKER_UPDATED`
 
 ### 2026.10.18b
-- Neue Seite „Server Monitor Status“ mit Live-Ansicht, Aktualisierung alle 30 s
-- Datensammlung in `include/lib.php` ausgelagert, JSON-Endpunkt `include/data.php`
+- New page "Server Monitor Status" with live view, refreshed every 30 s
+- Data collection moved to `include/lib.php`, JSON endpoint `include/data.php`
 
 ### 2026.10.18a
-- CSRF-Token im Einstellungsformular explizit gesetzt
+- CSRF token set explicitly in the settings form
 
 ### 2026.10.18
-- Erste Version: Disks, SMART, Speicher, Docker, VMs, System, USV, Docker-Updates
+- First version: disks, SMART, storage, Docker, VMs, system, UPS, Docker updates
