@@ -2,7 +2,7 @@
 
 srvmon monitors the health of an Unraid server and reports relevant events through Unraid's own notification system (email, push services) and optionally via webhook, for example to Home Assistant for Alexa announcements. It also provides a live status page in the WebGUI.
 
-Version: 2026.10.18p
+Version: 2026.10.18q
 Repository: https://github.com/MarioKonang/unraid-srvmon
 Target platform: Unraid 6.12 and newer (used on 7.2.4, see [Verification status](#verification-status))
 
@@ -682,7 +682,7 @@ The cron job calls the script every minute; the script checks the interval itsel
 | Disks | `/var/local/emhttp/disks.ini` |
 | SMART | `smartctl -n standby -j -H -A /dev/<device>` |
 | Storage space | `mountpoint -q` and the PHP functions `disk_total_space` and `disk_free_space` |
-| Docker | `docker ps -a`, `docker inspect` (image ID, image reference, networks, labels) |
+| Docker | `docker ps -a`, `docker inspect` (JSON output: image ID, image reference, networks, labels) |
 | VMs | `virsh list --all --name`, `virsh domstate` |
 | CPU, RAM, uptime | `/proc/loadavg`, `/proc/meminfo`, `/proc/uptime`, `nproc` |
 | Reboot | `/proc/sys/kernel/random/boot_id` |
@@ -758,8 +758,6 @@ srvmon was developed and tested with simulated Unraid files and tools and has si
 | Immich answers `/api/server/ping` with `pong` (path of current versions) | open `https://<immich host>/api/server/ping` in the browser |
 | cron entry is present after a reboot without manual action | after a reboot: `date -d @$(cat /tmp/srvmon/lastrun)` |
 | format of the Docker update file (fields `local` and `remote`) | `head -c 500 /var/lib/docker/unraid-update-status.json` |
-| Docker converts `\t` in `--format` templates to tabs | `docker inspect --format '{{.Name}}\t{{.Image}}' $(docker ps -aq)` must print tab-separated lines |
-| network list from `docker inspect` (`range` over `.NetworkSettings.Networks`) | `docker inspect --format '{{.Name}}: {{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' $(docker ps -aq)` |
 | plugin attributes `icon`, `launch` and `support` are evaluated in the plugin list | check the plugin list: icon, clickable name, support link |
 | header `Markdown="false"` on the status page | open the status page and check for rendering errors |
 
@@ -785,6 +783,10 @@ srvmon was developed and tested with simulated Unraid files and tools and has si
 ---
 
 ## Changelog
+
+### 2026.10.18q
+- Fix: performed container updates and network changes were never detected. `docker inspect --format` does not turn `\t` into tabs, so the fields could not be split and srvmon saw no containers. srvmon now reads the JSON output of `docker inspect`.
+- Whitespace in image version labels (linuxserver images contain tabs) is collapsed
 
 ### 2026.10.18p
 - Notification when a container loses or joins a Docker network, e.g. a reverse proxy that lost the network shared with its targets after it was recreated

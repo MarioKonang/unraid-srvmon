@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "srvmon">
 <!ENTITY author    "MarioKonang">
-<!ENTITY version   "2026.10.18p">
+<!ENTITY version   "2026.10.18q">
 <!ENTITY repo      "https://github.com/MarioKonang/unraid-srvmon">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/MarioKonang/unraid-srvmon/main/srvmon.plg">
 <!ENTITY emhttp    "/usr/local/emhttp/plugins/&name;">
@@ -11,6 +11,9 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" pluginURL="&pluginURL;" min="6.12.0" icon="heartbeat" launch="Settings/srvmon" support="&repo;">
 
 <CHANGES>
+###2026.10.18q
+- Fix: performed container updates and network changes were never detected (docker inspect --format does not convert \t); srvmon now reads the JSON output of docker inspect
+
 ###2026.10.18p
 - Notification when a container loses or joins a Docker network (e.g. reverse proxy lost its shared network)
 - Status page: Docker networks per container
@@ -380,22 +383,21 @@ function sm_get_docker_images(): ?array
     if ($rc !== 0) return $cache = null;
     $ids = array_filter(array_map('trim', $ids), 'strlen');
     if (!$ids) return $cache = [];
+    // full JSON instead of a --format template: "docker inspect" does not turn \t into tabs
     $out = [];
-    $fmt = '{{.Name}}\t{{.Image}}\t{{.Config.Image}}\t{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}\t{{json .Config.Labels}}';
-    exec('timeout 60 docker inspect --format ' . escapeshellarg($fmt) . ' '
-         . implode(' ', array_map('escapeshellarg', $ids)) . ' 2>/dev/null', $out, $rc);
-    if ($rc !== 0) return $cache = null;     // e.g. container removed meanwhile: retry next run
+    exec('timeout 60 docker inspect ' . implode(' ', array_map('escapeshellarg', $ids)) . ' 2>/dev/null', $out, $rc);
+    $j = json_decode(implode("\n", $out), true);
+    if ($rc !== 0 || !is_array($j)) return $cache = null;   // e.g. container removed meanwhile: retry next run
     $r = [];
-    foreach ($out as $line) {
-        $f = explode("\t", $line, 5);
-        if (count($f) < 5) continue;
-        $labels  = json_decode($f[4], true);
-        $labels  = is_array($labels) ? $labels : [];
+    foreach ($j as $c) {
+        if (!is_array($c) || !isset($c['Name'], $c['Image'])) continue;
+        $labels  = is_array($c['Config']['Labels'] ?? null) ? $c['Config']['Labels'] : [];
         $version = (string)($labels['org.opencontainers.image.version'] ?? $labels['version'] ?? $labels['build_version'] ?? '');
-        $nets    = array_values(array_filter(explode(' ', $f[3]), 'strlen'));
+        $version = (string)preg_replace('/\s+/u', ' ', $version);   // linuxserver labels contain tabs
+        $nets    = array_map('strval', array_keys(is_array($c['NetworkSettings']['Networks'] ?? null) ? $c['NetworkSettings']['Networks'] : []));
         sort($nets);
-        $r[ltrim($f[0], '/')] = ['id' => $f[1], 'image' => $f[2], 'networks' => $nets,
-                                 'version' => preg_match('/^.{0,80}/us', trim($version), $m) ? $m[0] : ''];
+        $r[ltrim((string)$c['Name'], '/')] = ['id' => (string)$c['Image'], 'image' => (string)($c['Config']['Image'] ?? ''),
+                                              'networks' => $nets, 'version' => preg_match('/^.{0,80}/us', trim($version), $m) ? $m[0] : ''];
     }
     return $cache = $r;
 }
