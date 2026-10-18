@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "srvmon">
 <!ENTITY author    "MarioKonang">
-<!ENTITY version   "2026.10.18k">
+<!ENTITY version   "2026.10.18l">
 <!ENTITY repo      "https://github.com/MarioKonang/unraid-srvmon">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/MarioKonang/unraid-srvmon/main/srvmon.plg">
 <!ENTITY emhttp    "/usr/local/emhttp/plugins/&name;">
@@ -11,6 +11,11 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" pluginURL="&pluginURL;" min="6.12.0" icon="heartbeat" launch="Settings/srvmon" support="&repo;">
 
 <CHANGES>
+###2026.10.18l
+- Notification about available Unraid OS and plugin updates (from Unraid's own update checks, once per new version)
+- Status page: new card "Unraid OS and plugins"
+- New options CHECK_OS_UPDATES and CHECK_PLUGIN_UPDATES
+
 ###2026.10.18k
 - All texts (user interface, notifications, documentation) translated to English
 - Dates shown in ISO format (YYYY-MM-DD)
@@ -61,7 +66,7 @@
 <FILE Name="&emhttp;/README.md">
 <INLINE><![CDATA[**Server Monitor (srvmon)**
 
-Monitors disks, SMART, storage space, Docker containers and updates, VMs, system, UPS and TLS certificates and reports problems via Unraid's notifications. Settings and live status under Settings > User Utilities.
+Monitors disks, SMART, storage space, Docker containers and updates, Unraid OS and plugin updates, VMs, system, UPS and TLS certificates and reports problems via Unraid's notifications. Settings and live status under Settings > User Utilities.
 ]]></INLINE>
 </FILE>
 
@@ -76,6 +81,8 @@ CHECK_SYSTEM="yes"
 CHECK_UPS="yes"
 CHECK_UPDATES="yes"
 CHECK_DOCKER_UPDATED="yes"
+CHECK_OS_UPDATES="yes"
+CHECK_PLUGIN_UPDATES="yes"
 TEMP_HDD_WARN="45"
 TEMP_HDD_CRIT="50"
 TEMP_NVME_WARN="60"
@@ -116,6 +123,11 @@ const SM_TMP         = '/tmp/srvmon';                              // RAM
 const SM_NOTIFY      = '/usr/local/emhttp/webGui/scripts/notify';
 const SM_DISKS_INI   = '/var/local/emhttp/disks.ini';
 const SM_DOCKER_UPD  = '/var/lib/docker/unraid-update-status.json';
+const SM_OS_VERSION  = '/etc/unraid-version';
+const SM_OS_CHECK    = '/tmp/unraidcheck/result.json';    // result of Unraid's OS update check
+const SM_OS_IGNORED  = '/tmp/unraidcheck/ignored.json';   // releases ignored in the Update OS dialog
+const SM_PLG_NEW     = '/tmp/plugins';                    // .plg files downloaded by Unraid's plugin check
+const SM_PLG_LOCAL   = '/var/log/plugins';                // installed plugins
 
 // Watched ATA counters: id => [label, level on increase]
 const SM_ATA_WATCH = [
@@ -372,6 +384,73 @@ function sm_get_updates(): ?array
     return $avail;
 }
 
+function sm_os_version(): string
+{
+    $v = @parse_ini_file(SM_OS_VERSION) ?: [];
+    return (string)($v['version'] ?? '');
+}
+
+/**
+ * Reads the result of Unraid's own OS update check; srvmon does not query the release server itself.
+ * null = no check has run since boot.
+ */
+function sm_get_os_update(): ?array
+{
+    if (!is_file(SM_OS_CHECK)) return null;
+    $j = json_decode((string)@file_get_contents(SM_OS_CHECK), true);
+    if (!is_array($j)) return null;
+    $cur = sm_os_version();
+    $ver = (string)($j['version'] ?? '');
+    $ign = json_decode((string)@file_get_contents(SM_OS_IGNORED), true);
+    $ign = is_array($ign['updateOsIgnoredReleases'] ?? null) ? $ign['updateOsIgnoredReleases'] : [];
+    // isNewer refers to the version at check time; compare again in case an update was installed meanwhile
+    $newer = !empty($j['isNewer']) && $ver !== '' && ($cur === '' || version_compare($ver, $cur, '>'));
+    return [
+        'current' => $cur,
+        'version' => $newer ? $ver : null,
+        'ignored' => $newer && in_array($ver, $ign, true),
+        'error'   => isset($j['error']) ? (string)$j['error'] : null,
+        'checked' => (int)@filemtime(SM_OS_CHECK),
+    ];
+}
+
+/** Attribute of a .plg file (entities resolved), as Unraid's plugin manager reads it. */
+function sm_plg_attr(string $file, string $attr): string
+{
+    $xml = @simplexml_load_file($file, null, LIBXML_NOCDATA);
+    return $xml === false ? '' : (string)($xml->attributes()[$attr] ?? '');
+}
+
+/**
+ * Compares the .plg files downloaded by Unraid's plugin check with the installed ones.
+ * Same rules as Unraid: string comparison of the version, min/max OS version must fit.
+ * null = no plugin check has run since boot.
+ */
+function sm_get_plugin_updates(): ?array
+{
+    $files = glob(SM_PLG_NEW . '/*.plg') ?: [];
+    if (!$files) return null;
+    $os  = sm_os_version();
+    $r   = [];
+    $chk = 0;
+    foreach ($files as $f) {
+        $name = basename($f, '.plg');
+        if (in_array($name, ['unRAIDServer', 'unRAIDServer-'], true)) continue;   // OS, see sm_get_os_update
+        $chk = max($chk, (int)@filemtime($f));
+        $installed = SM_PLG_LOCAL . "/$name.plg";
+        if (!is_file($installed)) continue;              // downloaded but not installed
+        $new = sm_plg_attr($f, 'version');
+        $old = sm_plg_attr($installed, 'version');
+        if ($new === '' || $old === '' || strcmp($new, $old) <= 0) continue;
+        $min = sm_plg_attr($f, 'min');
+        $max = sm_plg_attr($f, 'max');
+        if ($os !== '' && (($min !== '' && version_compare($min, $os, '>')) || ($max !== '' && version_compare($max, $os, '<')))) continue;
+        $r[$name] = ['installed' => $old, 'available' => $new];
+    }
+    ksort($r, SORT_NATURAL | SORT_FLAG_CASE);
+    return ['updates' => $r, 'checked' => $chk ?: null];
+}
+
 // ------------------------------------------------------------ TLS certificates
 
 /** Parse the output of "openssl x509 -noout -enddate -subject -issuer -ext subjectAltName". */
@@ -551,6 +630,11 @@ if (sm_on($cfg, 'CHECK_VMS')) {
 }
 if (sm_on($cfg, 'CHECK_UPS'))     $out['ups']     = sm_get_ups();
 if (sm_on($cfg, 'CHECK_UPDATES')) $out['updates'] = sm_get_updates();
+if (sm_on($cfg, 'CHECK_OS_UPDATES') || sm_on($cfg, 'CHECK_PLUGIN_UPDATES')) {
+    $out['sysupd'] = ['os_current' => sm_os_version()];
+    if (sm_on($cfg, 'CHECK_OS_UPDATES'))     $out['sysupd']['os']      = sm_get_os_update();
+    if (sm_on($cfg, 'CHECK_PLUGIN_UPDATES')) $out['sysupd']['plugins'] = sm_get_plugin_updates();
+}
 if (sm_on($cfg, 'CHECK_CERTS')) {
     // result of the last check run; no TLS handshakes on every page load
     $certs = json_decode((string)@file_get_contents(SM_TMP . '/certs.json'), true);
@@ -616,6 +700,8 @@ if (sm_on($cfg, 'CHECK_VMS'))     sm_check_vms($cfg, $state, $issues, $events, $
 if (sm_on($cfg, 'CHECK_SYSTEM'))  sm_check_system($cfg, $state, $issues, $events, $ran);
 if (sm_on($cfg, 'CHECK_UPS'))     sm_check_ups($issues, $ran);
 if (sm_on($cfg, 'CHECK_UPDATES')) sm_check_updates($state, $events);
+if (sm_on($cfg, 'CHECK_OS_UPDATES'))     sm_check_os_update($state, $events);
+if (sm_on($cfg, 'CHECK_PLUGIN_UPDATES')) sm_check_plugin_updates($state, $events);
 if (sm_on($cfg, 'CHECK_CERTS'))   sm_check_certs($cfg, $force, $state, $issues, $ran);
 
 // ---------------------------------------------------------------- Evaluation
@@ -1039,6 +1125,38 @@ function sm_check_updates(array &$state, array &$events): void
     $state['updates'] = $avail;
 }
 
+/** Reports every new Unraid OS version once. Versions ignored in the Update OS dialog are skipped. */
+function sm_check_os_update(array &$state, array &$events): void
+{
+    $u = sm_get_os_update();
+    if ($u === null || $u['error'] !== null) return;   // no or failed check: keep the last state
+    $ver = ($u['version'] !== null && !$u['ignored']) ? $u['version'] : '';
+    if ($ver !== '' && $ver !== ($state['os_update'] ?? '')) {
+        $events[] = ['normal', "Unraid OS $ver available",
+            "Installed: {$u['current']}. Update via Tools > Update OS; read the release notes first."];
+    }
+    $state['os_update'] = $ver;
+}
+
+/** Reports every new plugin version once, all plugins of a run in one notification. */
+function sm_check_plugin_updates(array &$state, array &$events): void
+{
+    $p = sm_get_plugin_updates();
+    if ($p === null) return;
+    $prev  = $state['plugin_updates'] ?? [];
+    $now   = [];
+    $items = [];
+    foreach ($p['updates'] as $name => $v) {
+        $now[$name] = $v['available'];
+        if (($prev[$name] ?? '') !== $v['available']) $items[] = "$name {$v['installed']} -> {$v['available']}";
+    }
+    if ($items) {
+        $events[] = ['normal', count($items) . ' plugin update(s) available',
+            implode('; ', $items) . '. Update via the Plugins tab.'];
+    }
+    $state['plugin_updates'] = $now;
+}
+
 // ================================================================== Helpers
 
 function sm_send(string $lvl, string $subj, string $desc, bool $forceHook = false): void
@@ -1164,7 +1282,7 @@ if (!function_exists('sm_v')) {
 <?php endforeach; ?>
 </tbody></table>
 <?php endif; ?>
-<p><small>Emails are sent by Unraid's notification system. Configure SMTP and the email agents per level under Settings &gt; Notifications. Update notifications have the level Notice: to receive them by email, enable the email agent for Notices there. Available Docker updates come from Unraid's own update check; its schedule is also set under Settings &gt; Notifications.</small></p>
+<p><small>Emails are sent by Unraid's notification system. Configure SMTP and the email agents per level under Settings &gt; Notifications. Update notifications have the level Notice: to receive them by email, enable the email agent for Notices there. Available Docker, Unraid OS and plugin updates come from Unraid's own update checks; their schedules are also set under Settings &gt; Notifications.</small></p>
 </div>
 
 <form markdown="1" name="srvmon_settings" method="POST" action="/update.php" target="progressFrame">
@@ -1220,6 +1338,14 @@ Notify about available updates:
 
 Notify about performed updates:
 : <?=sm_yn($sm,'CHECK_DOCKER_UPDATED')?>
+
+<div class="srvmon-sec">Unraid OS and plugins<small>uses the result of Unraid's own update checks</small></div>
+
+Notify about Unraid OS updates:
+: <?=sm_yn($sm,'CHECK_OS_UPDATES')?>
+
+Notify about plugin updates:
+: <?=sm_yn($sm,'CHECK_PLUGIN_UPDATES')?>
 
 <div class="srvmon-sec">VMs</div>
 
@@ -1415,6 +1541,29 @@ Markdown="false"
       else{b='<div class="smd-row"><span class="smd-warn">'+d.updates.length+' update(s) available</span></div><ul style="margin:.3em 0 0 1.2em;padding:0">';
         d.updates.forEach(function(u){b+='<li>'+esc(u)+'</li>';});b+='</ul>';}
       h+=card('Docker updates',b);
+    }
+    if(d.sysupd){
+      var su=d.sysupd,b='';
+      if('os' in su){
+        var o=su.os,os;
+        if(!o)os='<span class="smd-muted">no check since boot</span>';
+        else if(o.error)os='<span class="smd-warn">check failed</span>';
+        else if(o.version)os=o.ignored?'<span class="smd-muted">'+esc(o.version)+' (ignored)</span>':chip(o.version+' available','smd-warn');
+        else os='<span class="smd-ok">up to date</span>';
+        b+='<div class="smd-row"><span>Unraid OS '+esc(su.os_current||'?')+'</span><span>'+os+'</span></div>';
+        if(o&&o.checked)b+='<div class="smd-row smd-muted"><span>Checked</span><span>'+fmtT(o.checked)+'</span></div>';
+      }
+      if('plugins' in su){
+        var p=su.plugins;
+        if(!p)b+='<div class="smd-row"><span>Plugins</span><span class="smd-muted">no check since boot</span></div>';
+        else{var names=Object.keys(p.updates);
+          b+='<div class="smd-row"><span>Plugins</span><span>'+(names.length?chip(names.length+' update(s)','smd-warn'):'<span class="smd-ok">up to date</span>')+'</span></div>';
+          if(names.length){b+='<div class="smd-scroll"><table><tbody>';
+            names.forEach(function(n){var v=p.updates[n];b+='<tr><td>'+esc(n)+'</td><td class="smd-muted">'+esc(v.installed)+' → <span class="smd-warn">'+esc(v.available)+'</span></td></tr>';});
+            b+='</tbody></table></div>';}
+          if(p.checked)b+='<div class="smd-row smd-muted"><span>Checked</span><span>'+fmtT(p.checked)+'</span></div>';}
+      }
+      h+=card('Unraid OS and plugins',b);
     }
     if('certs' in d){
       var b;

@@ -2,7 +2,7 @@
 
 srvmon monitors the health of an Unraid server and reports relevant events through Unraid's own notification system (email, push services) and optionally via webhook, for example to Home Assistant for Alexa announcements. It also provides a live status page in the WebGUI.
 
-Version: 2026.10.18k
+Version: 2026.10.18l
 Repository: https://github.com/MarioKonang/unraid-srvmon
 Target platform: Unraid 6.12 and newer (used on 7.2.3, see [Verification status](#verification-status))
 
@@ -128,7 +128,23 @@ Not reported as an update:
 
 **Important:** all update notifications have the level `normal`. To receive them by email, the email agent for **Notices** must be enabled under *Settings > Notifications*.
 
-srvmon does not check Unraid OS or plugin updates. Unraid offers its own options for these under *Settings > Notifications*.
+### Unraid OS and plugin updates
+
+| Check | Condition | Level |
+|---|---|---|
+| Unraid OS update | Unraid's OS update check reports a newer version that is not ignored (once per new version) | normal |
+| Plugin update | Unraid's plugin check downloaded a newer `.plg` for an installed plugin (once per new version, all plugins of a run in one notification) | normal |
+
+**Source:** as with Docker, srvmon does not contact the release server or plugin repositories itself. It reads the results of Unraid's own checks:
+
+- **Unraid OS:** `/tmp/unraidcheck/result.json`, written by Unraid's OS update check. The installed version comes from `/etc/unraid-version`. Versions ignored in the *Update OS* dialog (`/tmp/unraidcheck/ignored.json`) are not reported.
+- **Plugins:** Unraid's plugin check downloads the current `.plg` of every installed plugin to `/tmp/plugins/`. srvmon compares its version with the installed plugin in `/var/log/plugins/`, using the same rules as Unraid: string comparison of the version, and the `min`/`max` OS version of the new plugin must fit the installed Unraid version. srvmon itself is included.
+
+Both results live in RAM and are empty after a reboot until Unraid's next check. In that case srvmon reports nothing and keeps its last state, so known updates are not reported again.
+
+**Schedule:** how current the information is depends on Unraid's checks. Enable them under *Settings > Notifications* (*Unraid OS update check* and *Plugins update check*). Opening *Tools > Update OS* or clicking *Check for updates* in the *Plugins* tab also refreshes the results.
+
+**Duplicate notifications:** Unraid's scheduled checks send their own notification as well, so an update usually appears twice. What srvmon adds is the webhook (e.g. Alexa) and the overview on the status page. If the duplicates bother you, set `CHECK_OS_UPDATES` or `CHECK_PLUGIN_UPDATES` to `no`; the status page card then disappears as well.
 
 ### TLS certificates (Nginx Proxy Manager)
 
@@ -233,7 +249,7 @@ Rules:
    ```bash
    echo "srvmon-$(openssl rand -hex 16)"
    ```
-3. **Create an automation** (YAML mode) and adjust the ID and entity IDs:
+3. **Create an automation** (YAML mode) and adjust the ID and entity IDs. It sends every notification as a push message to the Alexa app, so you can read it later if you missed the announcement, and announces it on the Echo device (alerts always, warnings only during the day):
    ```yaml
    alias: Unraid srvmon to Alexa
    mode: queued
@@ -242,36 +258,54 @@ Rules:
        webhook_id: srvmon-YOUR_GENERATED_ID
        allowed_methods: [POST]
        local_only: true
-   conditions:
-     # alerts always, warnings only during the day
-     - condition: template
-       value_template: >
-         {{ trigger.json.level == 'alert' or (7 <= now().hour < 22) }}
    actions:
+     # push message to the Alexa app: always, with the full text
      - action: notify.alexa_media
+       continue_on_error: true
        data:
-         message: "{{ trigger.json.speech }}"
+         message: "{{ trigger.json.subject }}: {{ trigger.json.description }}"
          target:
            - media_player.echo_living_room
          data:
-           type: announce
+           type: push
+     # voice announcement: alerts always, warnings only during the day
+     - if:
+         - condition: template
+           value_template: "{{ trigger.json.level == 'alert' or (7 <= now().hour < 22) }}"
+       then:
+         - action: notify.alexa_media
+           data:
+             message: "{{ trigger.json.speech }}"
+             target:
+               - media_player.echo_living_room
+             data:
+               type: announce
    ```
+   For `type: push`, one Echo device as `target` is enough; the message goes to the Alexa app of the Amazon account. `continue_on_error` makes sure the announcement still happens if the push fails. Without the push, remove the first action and keep only the content of `then:`.
    You find the entity IDs of your Echo devices (`media_player.…`) under *Settings > Devices & services > Alexa Media Player > Entities*. Under `target:` only `media_player.…` entities belong, never `notify.…`. Check under *Developer tools > Actions* that the action `notify.alexa_media` exists. The syntax `triggers`/`trigger:` and `actions`/`action:` applies to current Home Assistant versions; older versions expect `trigger:`/`platform:` and `action:`/`service:`.
 
-   **All devices:** replace the `target` list with a template:
+   **All devices:** replace the `target` list of the announcement with a template:
    ```yaml
-         target: "{{ integration_entities('alexa_media') | select('match', 'media_player\\.') | list }}"
+             target: "{{ integration_entities('alexa_media') | select('match', 'media_player\\.') | list }}"
    ```
    Depending on your Alexa setup, speaker groups may be included, which can lead to duplicate announcements; in that case maintain the list by hand.
 
-   **Different devices per level**, e.g. alerts everywhere, warnings only in the office:
+   **Push via the Home Assistant app instead:** Alexa Media Player depends on an unofficial Amazon sign-in. The Home Assistant companion app is more reliable for push messages and can deliver alerts as critical notifications. Replace the first action with:
    ```yaml
-         target: >
-           {% if trigger.json.level == 'alert' %}
-             {{ integration_entities('alexa_media') | select('match', 'media_player\\.') | list }}
-           {% else %}
-             {{ ['media_player.echo_office'] }}
-           {% endif %}
+     - action: notify.mobile_app_my_phone
+       data:
+         title: "{{ trigger.json.subject }}"
+         message: "{{ trigger.json.description }}"
+   ```
+
+   **Different devices per level** for the announcement, e.g. alerts everywhere, warnings only in the office:
+   ```yaml
+             target: >
+               {% if trigger.json.level == 'alert' %}
+                 {{ integration_entities('alexa_media') | select('match', 'media_player\\.') | list }}
+               {% else %}
+                 {{ ['media_player.echo_office'] }}
+               {% endif %}
    ```
 4. **Configure srvmon:** `WEBHOOK_URL` = `http://<Home Assistant IP>:8123/api/webhook/<ID>`, e.g. `http://192.168.1.20:8123/api/webhook/srvmon-...`. If Home Assistant runs on the `br0` network with its own IP, use that IP.
 5. **Test Home Assistant directly** from the Unraid terminal:
@@ -311,6 +345,7 @@ The page is located under *Settings > User Utilities > Server Monitor Status*. I
 - disks as a table with status, temperature, errors and SMART values,
 - Docker and VMs with their state, watched entries are marked; for containers additionally an "Update" hint, the image version and the time of the last detected update,
 - available Docker updates,
+- Unraid OS and plugin updates: installed OS version, available OS version, plugins with installed and available version, time of Unraid's last check,
 - TLS certificates with source (file or live), expiry date, days left, issuer and notes. These come from the last hourly check; the time is shown below the table.
 
 The page reloads its data every 30 seconds while the browser tab is visible. Colours follow the configured thresholds.
@@ -335,8 +370,8 @@ srvmon stores no credentials. Delivery is handled entirely by Unraid.
 1. Under *Settings > Notifications* (SMTP settings) enter the SMTP server, port, sender and recipient.
 2. Under *Settings > Notification Settings*, enable the email agent (or another agent such as Telegram, Pushover or ntfy) for the desired levels:
    - **Warnings** and **Alerts**: recommended
-   - **Notices**: required for Docker update notifications, "Resolved" notifications and the srvmon test notification
-3. Enable the schedule for Unraid's Docker update check under *Settings > Notifications*. srvmon uses its result.
+   - **Notices**: required for update notifications (Docker, Unraid OS, plugins), "Resolved" notifications and the srvmon test notification
+3. Enable the schedules for Unraid's Docker, Unraid OS and plugin update checks under *Settings > Notifications*. srvmon uses their results.
 4. Use Unraid's test function to check that delivery works in general.
 
 **Microsoft accounts:** Microsoft has disabled or announced the end of password-based SMTP sign-in (basic authentication) and only allows OAuth2, which Unraid's SMTP settings do not support as far as known. For private Outlook.com accounts, password-based SMTP is very likely no longer available. Use a sending account with a provider that still allows SMTP with a password or app password; the recipient can still be your Microsoft address.
@@ -401,7 +436,7 @@ This removes the cron entry, the program files and the temporary files. Configur
 
 ## Configuration
 
-The settings are located under *Settings > User Utilities > Server Monitor*. The page is divided into the sections General, Disks and SMART, Storage space, Docker, VMs, System and UPS, TLS certificates and Additional notification channels. Settings are stored in `/boot/config/plugins/srvmon/srvmon.cfg`. Values not set there are taken from `default.cfg`.
+The settings are located under *Settings > User Utilities > Server Monitor*. The page is divided into the sections General, Disks and SMART, Storage space, Docker, Unraid OS and plugins, VMs, System and UPS, TLS certificates and Additional notification channels. Settings are stored in `/boot/config/plugins/srvmon/srvmon.cfg`. Values not set there are taken from `default.cfg`.
 
 Changes to the file take effect on the next run; no restart is needed.
 
@@ -426,6 +461,8 @@ Changes to the file take effect on the next run; no restart is needed.
 | `CHECK_UPS` | `yes` | UPS via apcupsd |
 | `CHECK_UPDATES` | `yes` | notify about available Docker updates |
 | `CHECK_DOCKER_UPDATED` | `yes` | notify about performed container updates (only together with `CHECK_DOCKER`) |
+| `CHECK_OS_UPDATES` | `yes` | notify about available Unraid OS updates |
+| `CHECK_PLUGIN_UPDATES` | `yes` | notify about available plugin updates |
 
 ### TLS certificates
 
@@ -544,7 +581,7 @@ The cron job calls the script every minute; the script checks the interval itsel
 | `/boot/config/plugins/srvmon.plg` | plugin definition, installed by Unraid on boot |
 | `/boot/config/plugins/srvmon/srvmon.cfg` | your settings |
 | `/boot/config/plugins/srvmon/srvmon.cron` | cron entry |
-| `/boot/config/plugins/srvmon/state.json` | active problems, SMART baseline, last known container and VM states, image ID and version per container, known updates |
+| `/boot/config/plugins/srvmon/state.json` | active problems, SMART baseline, last known container and VM states, image ID and version per container, known Docker, OS and plugin updates |
 
 `state.json` is only written when its content actually changes, to spare the flash drive.
 
@@ -573,6 +610,8 @@ The cron job calls the script every minute; the script checks the interval itsel
 | Reboot | `/proc/sys/kernel/random/boot_id` |
 | UPS | `apcaccess status` |
 | Docker updates | `/var/lib/docker/unraid-update-status.json` |
+| Unraid OS updates | `/tmp/unraidcheck/result.json`, `/tmp/unraidcheck/ignored.json`, `/etc/unraid-version` |
+| Plugin updates | `/tmp/plugins/*.plg` compared with `/var/log/plugins/*.plg` |
 | Certificate files | `openssl x509` on `<CERT_DIRS>/*/fullchain.pem` |
 | Served certificates | `openssl s_client` with SNI and `-verify_hostname` |
 | Delivery | `/usr/local/emhttp/webGui/scripts/notify`, `curl` for webhook and heartbeat |
@@ -603,7 +642,7 @@ All external calls run with `timeout`, so a hanging service does not block the r
 - **Missing disks:** that an assigned but missing disk keeps its ID in `disks.ini` is an assumption and has not been tested on a real system.
 - **`/mnt/user`:** usage is a combined value across array and pools. For individual disks, add the paths `/mnt/diskN` to `SPACE_PATHS`.
 - **CPU temperature** is not monitored, because the sensor configuration varies a lot between hardware.
-- **Unraid OS and plugin updates** are not checked by srvmon; Unraid has its own options for this.
+- **Unraid OS and plugin updates** are only as current as Unraid's own checks; srvmon does not trigger them. After a reboot there is no information until the next check.
 - **Update hint on the status page:** after an update, the "Update" hint may remain until Unraid's own update check runs again.
 - **Image to container mapping:** image references without a tag are treated as `:latest`. With different spellings of the same registry (e.g. with and without `docker.io/`), the mapping may fail; the notification then names only the image.
 - **Orphaned certificates:** srvmon does not read the NPM database and therefore does not know which certificates NPM actually uses. Superseded certificates are detected (see above); certificates of unused domains without a successor are still reported.
@@ -637,6 +676,8 @@ srvmon was developed and tested with simulated Unraid files and tools and has si
 | Docker converts `\t` in `--format` templates to tabs | `docker inspect --format '{{.Name}}\t{{.Image}}' $(docker ps -aq)` must print tab-separated lines |
 | plugin attributes `icon`, `launch` and `support` are evaluated in the plugin list | check the plugin list: icon, clickable name, support link |
 | header `Markdown="false"` on the status page | open the status page and check for rendering errors |
+| format of the OS check result (fields `isNewer`, `version`, `error`), taken from the Unraid source code | `cat /tmp/unraidcheck/result.json` after *Tools > Update OS* |
+| plugin check leaves the new `.plg` in `/tmp/plugins/`, taken from the Unraid source code | `ls -l /tmp/plugins/` after *Plugins > Check for updates* |
 
 ---
 
@@ -660,6 +701,12 @@ srvmon was developed and tested with simulated Unraid files and tools and has si
 ---
 
 ## Changelog
+
+### 2026.10.18l
+- Notification about available Unraid OS and plugin updates, based on Unraid's own update checks, once per new version
+- Status page: new card "Unraid OS and plugins"
+- New options `CHECK_OS_UPDATES` and `CHECK_PLUGIN_UPDATES`
+- Documentation: Home Assistant automation additionally sends a push message to the Alexa app (or the Home Assistant app), so missed announcements can be read later
 
 ### 2026.10.18k
 - All texts (user interface, notifications, documentation) translated to English
