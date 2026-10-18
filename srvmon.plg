@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "srvmon">
 <!ENTITY author    "MarioKonang">
-<!ENTITY version   "2026.10.18n">
+<!ENTITY version   "2026.10.18o">
 <!ENTITY repo      "https://github.com/MarioKonang/unraid-srvmon">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/MarioKonang/unraid-srvmon/main/srvmon.plg">
 <!ENTITY emhttp    "/usr/local/emhttp/plugins/&name;">
@@ -11,6 +11,12 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" pluginURL="&pluginURL;" min="6.12.0" icon="heartbeat" launch="Settings/srvmon" support="&repo;">
 
 <CHANGES>
+###2026.10.18o
+- Reachability from the internet via UptimeRobot: monitors are created and deleted by srvmon (presets for Nextcloud and Immich), outages are reported through the srvmon notification chain
+- Local diagnosis during an outage via Nginx Proxy Manager
+- Status page: new card "Reachability from the internet"
+- New options CHECK_EXTERNAL, UPTIMEROBOT_KEY and EXT_MONITORS
+
 ###2026.10.18n
 - Notification when a plugin was updated (installed version changed), all plugins of a run in one notification
 - Status page: plugins updated in the last 7 days
@@ -124,6 +130,9 @@ CERT_WARN_DAYS="20"
 CERT_CRIT_DAYS="7"
 CERT_VERIFY="yes"
 CERT_IGNORE=""
+CHECK_EXTERNAL="no"
+UPTIMEROBOT_KEY=""
+EXT_MONITORS=""
 WEBHOOK_URL=""
 WEBHOOK_LEVEL="warning"
 WEBHOOK_LANG="en"
@@ -489,6 +498,117 @@ function sm_get_plugin_updates(): ?array
     }
     ksort($r, SORT_NATURAL | SORT_FLAG_CASE);
     return ['updates' => $r, 'checked' => $chk ?: null];
+}
+
+// ------------------------------------------------------------ External checks (UptimeRobot)
+
+const SM_UR_API = 'https://api.uptimerobot.com/v3';
+const SM_UR_TAG = 'srvmon';   // marks monitors created by srvmon; only these are deleted
+
+/**
+ * Call the UptimeRobot API. Returns [http_code, decoded JSON or null, curl error].
+ * The key is passed via a header file (mode 0600), not on the command line, so it does not show up in the process list.
+ */
+function sm_ur(string $key, string $method, string $path, ?array $body = null): array
+{
+    @mkdir(SM_TMP, 0755, true);
+    $hdr = tempnam(SM_TMP, 'ur');
+    @chmod($hdr, 0600);
+    file_put_contents($hdr, "Authorization: Bearer $key\nContent-Type: application/json\nAccept: application/json\n");
+    $url = strncmp($path, 'http', 4) === 0 ? $path : SM_UR_API . $path;
+    $cmd = 'curl -sS -m 30 -X ' . escapeshellarg($method) . ' -H @' . escapeshellarg($hdr)
+         . ($body !== null ? ' --data-binary ' . escapeshellarg((string)json_encode($body, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)) : '')
+         . " -w '\\n%{http_code}' " . escapeshellarg($url) . ' 2>&1';
+    $out = []; $rc = 0;
+    exec($cmd, $out, $rc);
+    @unlink($hdr);
+    $code = (int)array_pop($out);
+    $txt  = implode("\n", $out);
+    if ($rc !== 0) return [0, null, trim($txt) ?: "curl exit code $rc"];
+    $j = json_decode($txt, true);
+    return [$code, is_array($j) ? $j : null, ''];
+}
+
+/** All monitors of the account (follows the pagination). null + error text if the API is not usable. */
+function sm_ur_monitors(string $key, ?string &$err, ?int &$code): ?array
+{
+    $all = []; $next = '/monitors?limit=200';
+    for ($page = 0; $next !== '' && $page < 10; $page++) {
+        [$code, $j, $cerr] = sm_ur($key, 'GET', $next);
+        if ($code !== 200 || !is_array($j['data'] ?? null)) {
+            $err = $cerr !== '' ? $cerr : ("HTTP $code" . (isset($j['message']) ? ': ' . $j['message'] : ''));
+            return null;
+        }
+        $all  = array_merge($all, $j['data']);
+        $next = (string)($j['nextLink'] ?? '');
+    }
+    return $all;
+}
+
+/**
+ * Parse an entry of EXT_MONITORS: "[nextcloud:|immich:|http:]https://host[:port][/path][@LAN-address[:port]]".
+ * Presets know the status path and the keyword of the application. null = invalid entry.
+ */
+function sm_parse_ext(string $e): ?array
+{
+    $e = trim($e); $type = 'http';
+    if (preg_match('/^(nextcloud|immich|http):(?=https?:)/i', $e, $m)) { $type = strtolower($m[1]); $e = substr($e, strlen($m[0])); }
+    $local = '';
+    $at = strrpos($e, '@');
+    if ($at !== false) { $local = substr($e, $at + 1); $e = substr($e, 0, $at); }
+    if ($local !== '' && !preg_match('/^[\w.\-]+(:\d{1,5})?$/', $local)) return null;
+    $u = parse_url($e);
+    if (!is_array($u) || !in_array(strtolower($u['scheme'] ?? ''), ['http', 'https'], true) || empty($u['host']) || isset($u['user'])) return null;
+    $scheme = strtolower($u['scheme']);
+    $path   = $u['path'] ?? '';
+    $preset = ['nextcloud' => ['/status.php', '"maintenance":false', 'Nextcloud'],
+               'immich'    => ['/api/server/ping', 'pong', 'Immich']][$type] ?? null;
+    if ($preset !== null && ($path === '' || $path === '/')) $path = $preset[0];
+    $path .= isset($u['query']) ? '?' . $u['query'] : '';
+    $url  = $scheme . '://' . $u['host'] . (isset($u['port']) ? ':' . $u['port'] : '') . ($path !== '' ? $path : '/');
+    $kw   = $preset[1] ?? '';
+    return [
+        'type' => $type, 'url' => $url, 'scheme' => $scheme, 'host' => $u['host'],
+        'port' => (int)($u['port'] ?? ($scheme === 'https' ? 443 : 80)), 'path' => $path !== '' ? $path : '/',
+        'keyword' => $kw, 'name' => $preset[2] ?? $u['host'], 'local' => $local,
+        'def' => ($kw !== '' ? 'KEYWORD' : 'HTTP') . '|' . sm_ext_norm($url) . '|' . $kw,
+    ];
+}
+
+/** Comparable form of a URL (UptimeRobot may normalise case or a trailing slash). */
+function sm_ext_norm(string $url): string
+{
+    return rtrim(strtolower($url), '/');
+}
+
+/** Definition key of an existing monitor, comparable with sm_parse_ext()['def']. */
+function sm_ext_def(array $m): string
+{
+    return strtoupper((string)($m['type'] ?? '')) . '|' . sm_ext_norm((string)($m['url'] ?? '')) . '|' . (string)($m['keywordValue'] ?? '');
+}
+
+/**
+ * Check the service locally via Nginx Proxy Manager (LAN address instead of the public one, with SNI).
+ * Returns [ok, short result text].
+ */
+function sm_ext_local(array $e): array
+{
+    [$addr, $port] = array_pad(explode(':', $e['local'], 2), 2, '');
+    $port = $port !== '' ? (int)$port : $e['port'];
+    $url  = $e['scheme'] . '://' . $e['host'] . ':' . $port . $e['path'];
+    $body = tempnam(SM_TMP, 'ext');
+    $out  = []; $rc = 0;
+    exec('timeout 20 curl -sk -m 15 -o ' . escapeshellarg($body)
+         . ' --resolve ' . escapeshellarg($e['host'] . ':' . $port . ':' . $addr)
+         . " -w '%{http_code}' " . escapeshellarg($url) . ' 2>/dev/null', $out, $rc);
+    $code = (int)($out[0] ?? 0);
+    $txt  = (string)@file_get_contents($body, false, null, 0, 65536);
+    @unlink($body);
+    $via  = "$addr:$port";
+    if ($code === 0) return [false, "no connection to $via"];
+    if ($code >= 400) return [false, "HTTP $code via $via"];
+    if ($e['keyword'] !== '' && strpos($txt, $e['keyword']) === false) return [false, "HTTP $code via $via, but the expected content is missing"];
+    return [true, "HTTP $code via $via"];
 }
 
 // ------------------------------------------------------------ TLS certificates
@@ -891,6 +1011,84 @@ const SM_TEXTS = [
         'fr' => "Un certificat valide jusqu'au {d1} existe sur le disque, mais un certificat valide jusqu'au {d2} est servi. Nginx Proxy Manager n'a probablement pas chargé le renouvellement ; redémarrez le conteneur.",
         'es' => "En el disco hay un certificado válido hasta {d1}, pero se sirve uno válido hasta {d2}. Probablemente Nginx Proxy Manager no cargó la renovación; reinicie el contenedor."],
 
+    // ---- external checks (UptimeRobot)
+    "{name} not reachable from the internet" => [
+        'de' => "{name} aus dem Internet nicht erreichbar", 'fr' => "{name} injoignable depuis Internet",
+        'es' => "{name} no accesible desde Internet"],
+    "UptimeRobot reports {url} as down since {t} ({reason})." => [
+        'de' => "UptimeRobot meldet {url} seit {t} als ausgefallen ({reason}).",
+        'fr' => "UptimeRobot signale {url} comme indisponible depuis {t} ({reason}).",
+        'es' => "UptimeRobot informa de que {url} está caído desde {t} ({reason})."],
+    "UptimeRobot reports {url} as down since {t} ({reason}). Local check OK ({@res}): the problem is probably on the way from the internet (DynDNS, router port forwarding, IPv6)." => [
+        'de' => "UptimeRobot meldet {url} seit {t} als ausgefallen ({reason}). Lokale Prüfung OK ({@res}): Das Problem liegt vermutlich auf dem Weg aus dem Internet (DynDNS, Portfreigabe im Router, IPv6).",
+        'fr' => "UptimeRobot signale {url} comme indisponible depuis {t} ({reason}). Vérification locale OK ({@res}) : le problème se situe probablement sur le chemin depuis Internet (DynDNS, redirection de port du routeur, IPv6).",
+        'es' => "UptimeRobot informa de que {url} está caído desde {t} ({reason}). Comprobación local correcta ({@res}): el problema está probablemente en el camino desde Internet (DynDNS, redirección de puertos del router, IPv6)."],
+    "UptimeRobot reports {url} as down since {t} ({reason}). Local check failed ({@res}): the problem is in Nginx Proxy Manager or the application." => [
+        'de' => "UptimeRobot meldet {url} seit {t} als ausgefallen ({reason}). Lokale Prüfung fehlgeschlagen ({@res}): Das Problem liegt bei Nginx Proxy Manager oder der Anwendung.",
+        'fr' => "UptimeRobot signale {url} comme indisponible depuis {t} ({reason}). Échec de la vérification locale ({@res}) : le problème se situe dans Nginx Proxy Manager ou dans l'application.",
+        'es' => "UptimeRobot informa de que {url} está caído desde {t} ({reason}). Falló la comprobación local ({@res}): el problema está en Nginx Proxy Manager o en la aplicación."],
+    "UptimeRobot reports {url} as down." => [
+        'de' => "UptimeRobot meldet {url} als ausgefallen.", 'fr' => "UptimeRobot signale {url} comme indisponible.",
+        'es' => "UptimeRobot informa de que {url} está caído."],
+    "UptimeRobot reports {url} as down. Local check OK ({@res}): the problem is probably on the way from the internet (DynDNS, router port forwarding, IPv6)." => [
+        'de' => "UptimeRobot meldet {url} als ausgefallen. Lokale Prüfung OK ({@res}): Das Problem liegt vermutlich auf dem Weg aus dem Internet (DynDNS, Portfreigabe im Router, IPv6).",
+        'fr' => "UptimeRobot signale {url} comme indisponible. Vérification locale OK ({@res}) : le problème se situe probablement sur le chemin depuis Internet (DynDNS, redirection de port du routeur, IPv6).",
+        'es' => "UptimeRobot informa de que {url} está caído. Comprobación local correcta ({@res}): el problema está probablemente en el camino desde Internet (DynDNS, redirección de puertos del router, IPv6)."],
+    "UptimeRobot reports {url} as down. Local check failed ({@res}): the problem is in Nginx Proxy Manager or the application." => [
+        'de' => "UptimeRobot meldet {url} als ausgefallen. Lokale Prüfung fehlgeschlagen ({@res}): Das Problem liegt bei Nginx Proxy Manager oder der Anwendung.",
+        'fr' => "UptimeRobot signale {url} comme indisponible. Échec de la vérification locale ({@res}) : le problème se situe dans Nginx Proxy Manager ou dans l'application.",
+        'es' => "UptimeRobot informa de que {url} está caído. Falló la comprobación local ({@res}): el problema está en Nginx Proxy Manager o en la aplicación."],
+    "no connection to {v}" => [
+        'de' => "keine Verbindung zu {v}", 'fr' => "pas de connexion vers {v}", 'es' => "sin conexión con {v}"],
+    "HTTP {c} via {v}, but the expected content is missing" => [
+        'de' => "HTTP {c} über {v}, aber der erwartete Inhalt fehlt",
+        'fr' => "HTTP {c} via {v}, mais le contenu attendu est absent",
+        'es' => "HTTP {c} a través de {v}, pero falta el contenido esperado"],
+    "HTTP {c} via {v}" => [
+        'de' => "HTTP {c} über {v}", 'fr' => "HTTP {c} via {v}", 'es' => "HTTP {c} a través de {v}"],
+    "External check: invalid entry" => [
+        'de' => "Externe Prüfung: ungültiger Eintrag", 'fr' => "Vérification externe : entrée invalide",
+        'es' => "Comprobación externa: entrada no válida"],
+    "The entry '{e}' in EXT_MONITORS could not be read. Format: [nextcloud:|immich:]https://host/path[@LAN-IP:port]." => [
+        'de' => "Der Eintrag '{e}' in EXT_MONITORS konnte nicht gelesen werden. Format: [nextcloud:|immich:]https://host/pfad[@LAN-IP:port].",
+        'fr' => "L'entrée '{e}' dans EXT_MONITORS n'a pas pu être lue. Format : [nextcloud:|immich:]https://hôte/chemin[@IP-LAN:port].",
+        'es' => "No se pudo leer la entrada '{e}' de EXT_MONITORS. Formato: [nextcloud:|immich:]https://host/ruta[@IP-LAN:puerto]."],
+    "External check: API key rejected" => [
+        'de' => "Externe Prüfung: API-Schlüssel abgelehnt", 'fr' => "Vérification externe : clé API refusée",
+        'es' => "Comprobación externa: clave API rechazada"],
+    "UptimeRobot rejected the API key ({err}). Check UPTIMEROBOT_KEY in the settings." => [
+        'de' => "UptimeRobot hat den API-Schlüssel abgelehnt ({err}). UPTIMEROBOT_KEY in den Einstellungen prüfen.",
+        'fr' => "UptimeRobot a refusé la clé API ({err}). Vérifiez UPTIMEROBOT_KEY dans les paramètres.",
+        'es' => "UptimeRobot ha rechazado la clave API ({err}). Compruebe UPTIMEROBOT_KEY en la configuración."],
+    "External check: UptimeRobot not reachable" => [
+        'de' => "Externe Prüfung: UptimeRobot nicht erreichbar", 'fr' => "Vérification externe : UptimeRobot injoignable",
+        'es' => "Comprobación externa: UptimeRobot no accesible"],
+    "The UptimeRobot API could not be reached {n} times in a row ({err}). Is the internet connection down?" => [
+        'de' => "Die UptimeRobot-API war {n}-mal hintereinander nicht erreichbar ({err}). Ist die Internetverbindung ausgefallen?",
+        'fr' => "L'API UptimeRobot a été injoignable {n} fois de suite ({err}). La connexion Internet est-elle coupée ?",
+        'es' => "La API de UptimeRobot no ha estado accesible {n} veces seguidas ({err}). ¿Se ha caído la conexión a Internet?"],
+    "External check created: {name}" => [
+        'de' => "Externe Prüfung angelegt: {name}", 'fr' => "Vérification externe créée : {name}",
+        'es' => "Comprobación externa creada: {name}"],
+    "srvmon created the UptimeRobot monitor for {url}. The first result follows within 5 minutes." => [
+        'de' => "srvmon hat den UptimeRobot-Monitor für {url} angelegt. Das erste Ergebnis folgt innerhalb von 5 Minuten.",
+        'fr' => "srvmon a créé le moniteur UptimeRobot pour {url}. Le premier résultat suit dans les 5 minutes.",
+        'es' => "srvmon ha creado el monitor de UptimeRobot para {url}. El primer resultado llegará en 5 minutos."],
+    "External check: monitor could not be created" => [
+        'de' => "Externe Prüfung: Monitor konnte nicht angelegt werden", 'fr' => "Vérification externe : impossible de créer le moniteur",
+        'es' => "Comprobación externa: no se pudo crear el monitor"],
+    "Creating the UptimeRobot monitor for {url} failed ({err})." => [
+        'de' => "Das Anlegen des UptimeRobot-Monitors für {url} ist fehlgeschlagen ({err}).",
+        'fr' => "La création du moniteur UptimeRobot pour {url} a échoué ({err}).",
+        'es' => "Falló la creación del monitor de UptimeRobot para {url} ({err})."],
+    "External check removed: {name}" => [
+        'de' => "Externe Prüfung entfernt: {name}", 'fr' => "Vérification externe supprimée : {name}",
+        'es' => "Comprobación externa eliminada: {name}"],
+    "srvmon deleted the UptimeRobot monitor for {url}, because it is no longer configured." => [
+        'de' => "srvmon hat den UptimeRobot-Monitor für {url} gelöscht, weil er nicht mehr konfiguriert ist.",
+        'fr' => "srvmon a supprimé le moniteur UptimeRobot pour {url}, car il n'est plus configuré.",
+        'es' => "srvmon ha eliminado el monitor de UptimeRobot para {url}, porque ya no está configurado."],
+
     // ---- updates
     "{n} Docker update(s) available" => [
         'de' => "{n} Docker-Update(s) verfügbar", 'fr' => "{n} mise(s) à jour Docker disponible(s)",
@@ -1061,6 +1259,11 @@ if (sm_on($cfg, 'CHECK_CERTS')) {
     $out['certs'] = is_array($certs) ? $certs : null;
     $out['thresholds']['cert'] = [sm_num($cfg, 'CERT_WARN_DAYS', 20), sm_num($cfg, 'CERT_CRIT_DAYS', 7)];
 }
+if (sm_on($cfg, 'CHECK_EXTERNAL') && trim((string)($cfg['UPTIMEROBOT_KEY'] ?? '')) !== '') {
+    // result of the last check run; the API key never goes to the browser
+    $ext = json_decode((string)@file_get_contents(SM_TMP . '/ext.json'), true);
+    $out['ext'] = is_array($ext) ? $ext : null;
+}
 
 echo json_encode($out, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
 ]]></INLINE>
@@ -1125,6 +1328,7 @@ if (sm_on($cfg, 'CHECK_OS_UPDATES'))     sm_check_os_update($state, $events);
 if (sm_on($cfg, 'CHECK_PLUGIN_UPDATES')) sm_check_plugin_updates($state, $events);
 if (sm_on($cfg, 'CHECK_PLUGIN_UPDATED')) sm_check_plugin_updated($state, $events);
 if (sm_on($cfg, 'CHECK_CERTS'))   sm_check_certs($cfg, $force, $state, $issues, $ran);
+if (sm_on($cfg, 'CHECK_EXTERNAL')) sm_check_external($cfg, $state, $issues, $events, $ran);
 
 // ---------------------------------------------------------------- Evaluation
 $now    = time();
@@ -1526,6 +1730,142 @@ function sm_check_certs(array $cfg, bool $force, array &$state, array &$issues, 
     }
 }
 
+/**
+ * External checks via UptimeRobot: keeps the monitors from EXT_MONITORS in sync (create/delete, only monitors
+ * tagged "srvmon" are deleted) and reports every monitor of the account that is DOWN.
+ */
+function sm_check_external(array $cfg, array &$state, array &$issues, array &$events, array &$ran): void
+{
+    global $dry;
+    $key = trim((string)($cfg['UPTIMEROBOT_KEY'] ?? ''));
+    if ($key === '') return;
+    $failFile = SM_TMP . '/ext_fail';   // RAM: consecutive API failures
+
+    // --- configuration
+    $want = [];
+    $invalid = false;
+    foreach (sm_list($cfg['EXT_MONITORS'] ?? '') as $entry) {
+        $e = sm_parse_ext($entry);
+        if ($e === null) {
+            $invalid = true;   // a typo must not delete the monitor of that entry
+            $issues['ext:cfg:' . $entry] = ['warning', 'External check: invalid entry',
+                "The entry '$entry' in EXT_MONITORS could not be read. Format: [nextcloud:|immich:]https://host/path[@LAN-IP:port]."];
+            continue;
+        }
+        $want[$e['def']] = $e;
+    }
+    // same name twice (e.g. two Nextcloud instances): add the host
+    $cnt = array_count_values(array_column($want, 'name'));
+    foreach ($want as &$e) if ($cnt[$e['name']] > 1 && $e['name'] !== $e['host']) $e['name'] .= " ({$e['host']})";
+    unset($e);
+
+    // --- read monitors
+    $err = null; $code = null;
+    $mons = sm_ur_monitors($key, $err, $code);
+    if ($mons === null) {
+        sm_keep($state, $issues, 'ext:mon:');                 // keep known outages, decide nothing
+        if ($code === 401 || $code === 403) {
+            $issues['ext:api'] = ['warning', 'External check: API key rejected',
+                "UptimeRobot rejected the API key ($err). Check UPTIMEROBOT_KEY in the settings."];
+        } else {
+            $n = (int)@file_get_contents($failFile) + 1;
+            if (!$dry) @file_put_contents($failFile, (string)$n);
+            if ($n >= 3) {
+                $issues['ext:api'] = ['warning', 'External check: UptimeRobot not reachable',
+                    "The UptimeRobot API could not be reached $n times in a row ($err). Is the internet connection down?"];
+            } else {
+                sm_keep($state, $issues, 'ext:api');
+            }
+        }
+        return;
+    }
+    if (!$dry) @unlink($failFile);
+    $ran[] = 'ext:';
+
+    // --- sync: match by remembered ID first, then by definition (URL, type, keyword)
+    $ids     = $state['ext_ids'] ?? [];                       // def => monitor ID created by srvmon
+    $byId    = [];
+    foreach ($mons as $m) $byId[(string)($m['id'] ?? '')] = $m;
+    $matched = [];                                            // monitor ID => def
+    foreach ($want as $def => $e) {
+        $id = (string)($ids[$def] ?? '');
+        if ($id === '' || !isset($byId[$id])) {
+            $id = '';
+            foreach ($mons as $m) if (sm_ext_def($m) === $def && !isset($matched[(string)$m['id']])) { $id = (string)$m['id']; break; }
+        }
+        if ($id !== '') { $matched[$id] = $def; $ids[$def] = $id; }
+    }
+    $created = 0;
+    foreach ($want as $def => $e) {
+        if (in_array($def, $matched, true)) continue;
+        if ($created >= 5) break;                             // safety net against creation loops
+        $created++;
+        $body = ['type' => $e['keyword'] !== '' ? 'KEYWORD' : 'HTTP', 'friendlyName' => $e['name'], 'url' => $e['url'],
+                 'interval' => 300, 'timeout' => 30, 'tagNames' => [SM_UR_TAG]];
+        if ($e['keyword'] !== '') $body += ['keywordType' => 'ALERT_NOT_EXISTS', 'keywordCaseType' => 'CaseSensitive', 'keywordValue' => $e['keyword']];
+        if ($dry) { echo "[dry-run] would create UptimeRobot monitor: {$e['url']}\n"; continue; }
+        [$c, $j, $cerr] = sm_ur($key, 'POST', '/monitors', $body);
+        if (($c === 200 || $c === 201) && isset($j['id'])) {
+            $ids[$def] = (string)$j['id'];
+            $mons[] = $j + ['status' => 'STARTED'];
+            $matched[(string)$j['id']] = $def;
+            $events[] = ['normal', "External check created: {$e['name']}",
+                "srvmon created the UptimeRobot monitor for {$e['url']}. The first result follows within 5 minutes."];
+        } else {
+            $issues['ext:cfg:' . $e['url']] = ['warning', 'External check: monitor could not be created',
+                "Creating the UptimeRobot monitor for {$e['url']} failed (" . ($cerr !== '' ? $cerr : "HTTP $c" . (isset($j['message']) ? ': ' . $j['message'] : '')) . ').'];
+        }
+    }
+    // delete monitors created by srvmon that are no longer configured
+    $known = array_flip(array_values($ids));
+    foreach ($mons as $i => $m) {
+        $id  = (string)($m['id'] ?? '');
+        $own = isset($known[$id]) || in_array(SM_UR_TAG, array_column((array)($m['tags'] ?? []), 'name'), true);
+        if (!$own || isset($matched[$id]) || $invalid) continue;
+        if ($dry) { echo "[dry-run] would delete UptimeRobot monitor: " . ($m['url'] ?? $id) . "\n"; continue; }
+        [$c] = sm_ur($key, 'DELETE', '/monitors/' . rawurlencode($id));
+        if ($c >= 200 && $c < 300) {
+            unset($mons[$i]);
+            $events[] = ['normal', 'External check removed: ' . ($m['friendlyName'] ?? $id),
+                'srvmon deleted the UptimeRobot monitor for ' . ($m['url'] ?? '?') . ', because it is no longer configured.'];
+        }
+    }
+    $state['ext_ids'] = array_intersect_key($ids, $want);
+
+    // --- evaluate all monitors of the account
+    $items = [];
+    foreach ($mons as $m) {
+        $id     = (string)($m['id'] ?? '');
+        $name   = (string)($m['friendlyName'] ?? $id);
+        $st     = strtoupper((string)($m['status'] ?? ''));
+        $e      = isset($matched[$id]) ? $want[$matched[$id]] : null;
+        $item   = ['name' => $e['name'] ?? $name, 'url' => (string)($m['url'] ?? ''), 'status' => $st, 'managed' => $e !== null];
+        if ($st === 'DOWN') {
+            $name   = $e['name'] ?? $name;
+            $inc    = is_array($m['lastIncident'] ?? null) ? $m['lastIncident'] : [];
+            $t      = strtotime((string)($inc['startedAt'] ?? '')) ?: null;
+            $reason = trim((string)($inc['reason'] ?? ''));
+            $desc   = $t !== null
+                ? sprintf('UptimeRobot reports %s as down since %s (%s).', $item['url'], date('Y-m-d H:i', $t), $reason !== '' ? $reason : '?')
+                : "UptimeRobot reports {$item['url']} as down.";
+            if ($e !== null && $e['local'] !== '') {
+                [$ok, $res] = sm_ext_local($e);
+                $desc .= $ok
+                    ? " Local check OK ($res): the problem is probably on the way from the internet (DynDNS, router port forwarding, IPv6)."
+                    : " Local check failed ($res): the problem is in Nginx Proxy Manager or the application.";
+                $item['local'] = $res;
+            }
+            $issues["ext:mon:$id"] = ['alert', "$name not reachable from the internet", $desc];
+            $item += ['since' => $t, 'reason' => $reason];
+        }
+        $items[] = $item;
+    }
+    if (!$dry) {
+        @file_put_contents(SM_TMP . '/ext.json', json_encode(['time' => time(), 'items' => $items],
+            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+    }
+}
+
 function sm_check_updates(array &$state, array &$events): void
 {
     $avail = sm_get_updates();
@@ -1867,6 +2207,17 @@ Verify trust chain and hostname:
 Ignored domains (comma-separated):
 : <input type="text" name="CERT_IGNORE" value="<?=sm_v($sm,'CERT_IGNORE')?>" style="width:30em">
 
+<div class="srvmon-sec">External checks<small>reachability from the internet via UptimeRobot</small></div>
+
+Check reachability from the internet:
+: <?=sm_yn($sm,'CHECK_EXTERNAL')?>
+
+UptimeRobot API key (main key, secret):
+: <input type="password" name="UPTIMEROBOT_KEY" value="<?=sm_v($sm,'UPTIMEROBOT_KEY')?>" style="width:30em" autocomplete="off">
+
+Services (comma-separated):
+: <input type="text" name="EXT_MONITORS" value="<?=sm_v($sm,'EXT_MONITORS')?>" style="width:30em" placeholder="nextcloud:https://cloud.example.com@192.168.1.10:4443">
+
 <div class="srvmon-sec">Additional notification channels<small>in addition to Unraid's notifications</small></div>
 
 Webhook URL (e.g. Home Assistant):
@@ -2064,6 +2415,18 @@ Markdown="false"
           b+='<tr><td>'+esc(c.name)+(c.names&&c.names.length>1?' <span class="smd-muted">+'+(c.names.length-1)+'</span>':'')+'</td><td>'+esc(c.source)+'</td><td>'+(c.expires?new Date(c.expires*1000).toLocaleDateString('en-GB'):'–')+'</td><td class="'+cls+'">'+(c.days==null?'–':c.days+' d')+'</td><td>'+note+'</td></tr>';});
         b+='</tbody></table></div><div class="smd-muted" style="margin-top:.4em">Checked: '+fmtT(d.certs.time)+'</div>';}
       h+=card('TLS certificates',b,true);
+    }
+    if('ext' in d){
+      var b;
+      if(!d.ext)b='<span class="smd-muted">No external check has run yet.</span>';
+      else if(!d.ext.items.length)b='<span class="smd-muted">No monitors in the UptimeRobot account.</span>';
+      else{b='<div class="smd-scroll"><table><tbody>';
+        d.ext.items.forEach(function(x){
+          var cls=x.status==='DOWN'?'smd-crit':(x.status==='UP'?'smd-ok':(x.status==='LOOKS_DOWN'?'smd-warn':'smd-muted'));
+          var note=x.status==='DOWN'?'since '+fmtT(x.since)+(x.reason?' · '+esc(x.reason):'')+(x.local?'<br>local: '+esc(x.local):''):esc(x.url);
+          b+='<tr><td>'+esc(x.name)+(x.managed?'':' <span class="smd-muted">(not managed by srvmon)</span>')+'</td><td>'+chip(x.status||'?',cls)+'</td><td class="smd-muted">'+note+'</td></tr>';});
+        b+='</tbody></table></div><div class="smd-muted" style="margin-top:.4em">Checked by UptimeRobot every 5 min · read: '+fmtT(d.ext.time)+'</div>';}
+      h+=card('Reachability from the internet',b,true);
     }
     document.getElementById('smd-grid').innerHTML=h;
   }

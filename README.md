@@ -2,7 +2,7 @@
 
 srvmon monitors the health of an Unraid server and reports relevant events through Unraid's own notification system (email, push services) and optionally via webhook, for example to Home Assistant for Alexa announcements. It also provides a live status page in the WebGUI.
 
-Version: 2026.10.18n
+Version: 2026.10.18o
 Repository: https://github.com/MarioKonang/unraid-srvmon
 Target platform: Unraid 6.12 and newer (used on 7.2.4, see [Verification status](#verification-status))
 
@@ -191,6 +191,51 @@ ls /mnt/user/appdata/NginxProxyManager/letsencrypt/live/
 ```
 
 Custom certificates uploaded in NPM live in a different directory. You can add it to `CERT_DIRS` as long as it uses the same `<directory>/*/fullchain.pem` layout.
+
+### Reachability from the internet (UptimeRobot)
+
+The checks above run on the server itself. They cannot see whether a service is reachable **from the internet**: a broken DynDNS entry, router port forwarding, IPv6 release or an application that answers with an error page (e.g. `502 Bad Gateway` from Nginx Proxy Manager) go unnoticed. srvmon therefore uses the free service [UptimeRobot](https://uptimerobot.com), which checks the URLs from outside every 5 minutes. srvmon creates the monitors, reads their results and reports outages through its own notification chain (Unraid, webhook, Alexa, reminders, "Resolved").
+
+| Check | Condition | Level |
+|---|---|---|
+| Not reachable from the internet | UptimeRobot reports a monitor as `DOWN` (any monitor of the account, not only those created by srvmon) | alert |
+| API key rejected | UptimeRobot answers with HTTP 401/403 | warning |
+| UptimeRobot not reachable | the API could not be reached in 3 runs in a row (e.g. the internet connection is down) | warning |
+| Invalid entry | an entry of `EXT_MONITORS` cannot be read | warning |
+| Monitor could not be created | UptimeRobot refused to create a monitor | warning |
+| Monitor created / removed | srvmon created or deleted a monitor (one-off event) | normal |
+
+`LOOKS_DOWN` (UptimeRobot is still confirming an outage) and paused monitors are not reported.
+
+**Entries in `EXT_MONITORS`** (comma-separated):
+
+| Entry | UptimeRobot checks |
+|---|---|
+| `nextcloud:https://cloud.example.com` | `https://cloud.example.com/status.php` must contain `"maintenance":false` (also catches maintenance mode and error pages) |
+| `immich:https://photos.example.com` | `https://photos.example.com/api/server/ping` must contain `pong` |
+| `https://app.example.com/health` | HTTP status: 2xx/3xx is up (UptimeRobot's default) |
+
+An explicit path after the host replaces the default path of a preset.
+
+**Local diagnosis:** append `@<LAN-IP>:<NPM-HTTPS-port>` to an entry, e.g. `nextcloud:https://cloud.example.com@192.168.1.10:4443` (the same notation as for `CERT_HOSTS`). When UptimeRobot reports an outage, srvmon then calls the same URL locally through Nginx Proxy Manager and adds the result to the notification:
+
+- *Local check OK*: Nginx Proxy Manager and the application work, so the problem is on the way from the internet (DynDNS, router port forwarding, IPv6).
+- *Local check failed* (e.g. `HTTP 502`, no connection, expected content missing): the problem is in Nginx Proxy Manager or the application.
+
+The local call only happens during an outage. It ignores certificate errors; certificates are checked separately.
+
+**Managing the monitors:** srvmon creates a monitor for every entry (interval 5 minutes, tag `srvmon`). If you remove an entry, srvmon deletes its monitor. Monitors without the tag `srvmon` are never changed or deleted, but they are evaluated as well. If an entry is invalid, srvmon deletes nothing in that run, so a typo cannot remove a monitor. If you change an entry, srvmon deletes the old monitor and creates a new one; the history of the old one is lost.
+
+**Setup:**
+
+1. Create a free account at [uptimerobot.com](https://uptimerobot.com).
+2. Create an API key under *Integrations & API > API*. srvmon needs the **main API key**, because it creates and deletes monitors.
+3. Enter the key and the services in the srvmon settings (section *External checks*) and enable the check.
+4. Check the result: `php /usr/local/emhttp/plugins/srvmon/scripts/check.php --force --dry-run` shows what srvmon would create without changing anything. The next regular run creates the monitors and reports this with "External check created".
+
+**UptimeRobot's own alerts:** srvmon does not assign alert contacts to the monitors it creates. If the whole server or the internet connection is down, srvmon cannot report anything; for that case use the [heartbeat](#heartbeat-outage-of-the-whole-server), or add your email address as alert contact to the monitors in UptimeRobot (then you receive outages twice while the server is running).
+
+**Limits of the free plan:** 50 monitors, check every 5 minutes, 10 API requests per minute. srvmon reads all monitors with one request per run (one more per 200 monitors).
 
 ---
 
@@ -449,7 +494,7 @@ This removes the cron entry, the program files and the temporary files. Configur
 
 ## Configuration
 
-The settings are located under *Settings > User Utilities > Server Monitor*. The page is divided into the sections General, Disks and SMART, Storage space, Docker, Unraid OS and plugins, VMs, System and UPS, TLS certificates and Additional notification channels. Settings are stored in `/boot/config/plugins/srvmon/srvmon.cfg`. Values not set there are taken from `default.cfg`.
+The settings are located under *Settings > User Utilities > Server Monitor*. The page is divided into the sections General, Disks and SMART, Storage space, Docker, Unraid OS and plugins, VMs, System and UPS, TLS certificates, External checks and Additional notification channels. Settings are stored in `/boot/config/plugins/srvmon/srvmon.cfg`. Values not set there are taken from `default.cfg`.
 
 Changes to the file take effect on the next run; no restart is needed.
 
@@ -490,6 +535,14 @@ Changes to the file take effect on the next run; no restart is needed.
 | `CERT_CRIT_DAYS` | `7` | alert at this many days left or fewer |
 | `CERT_VERIFY` | `yes` | verify trust chain and hostname in the live check |
 | `CERT_IGNORE` | empty | domains whose certificate files are ignored, comma-separated |
+
+### External checks
+
+| Key | Default | Description |
+|---|---|---|
+| `CHECK_EXTERNAL` | `no` | reachability from the internet via UptimeRobot on/off |
+| `UPTIMEROBOT_KEY` | empty | main API key of the UptimeRobot account (secret, see [Security](#security)) |
+| `EXT_MONITORS` | empty | services to check, comma-separated: `[nextcloud: or immich:]https://host[/path][@LAN-IP:port]`, see [Reachability from the internet](#reachability-from-the-internet-uptimerobot) |
 
 ### Additional notification channels
 
@@ -612,6 +665,8 @@ The cron job calls the script every minute; the script checks the interval itsel
 | `/tmp/srvmon/status.json` | status of the last run for the WebGUI |
 | `/tmp/srvmon/lastcert` | time of the last certificate check |
 | `/tmp/srvmon/certs.json` | result of the last certificate check for the status page |
+| `/tmp/srvmon/ext.json` | result of the last external check for the status page |
+| `/tmp/srvmon/ext_fail` | number of failed UptimeRobot requests in a row |
 
 ---
 
@@ -633,6 +688,7 @@ The cron job calls the script every minute; the script checks the interval itsel
 | Performed plugin updates | `version` attribute of `/var/log/plugins/*.plg` |
 | Certificate files | `openssl x509` on `<CERT_DIRS>/*/fullchain.pem` |
 | Served certificates | `openssl s_client` with SNI and `-verify_hostname` |
+| Reachability from the internet | UptimeRobot API v3 (`https://api.uptimerobot.com/v3/monitors`) via `curl`; local diagnosis with `curl --resolve` |
 | Delivery | `/usr/local/emhttp/webGui/scripts/notify`, `curl` for webhook and heartbeat |
 
 All external calls run with `timeout`, so a hanging service does not block the run.
@@ -645,7 +701,8 @@ All external calls run with `timeout`, so a hanging service does not block the r
 - **Read-only checks.** Apart from its own paths, srvmon writes nothing to the server; external commands are only called for reading.
 - **Status page behind the login.** The JSON endpoint lives in the plugin directory of the WebGUI and is therefore protected by the WebGUI login. It does not send disk IDs, which usually contain serial numbers, to the browser.
 - **Webhook ID and heartbeat URL are secrets.** They are stored in `srvmon.cfg` on the flash drive, not in the `.plg`. Do not publish the configuration file. In Home Assistant keep `local_only: true` so the webhook can only be triggered from the local network.
-- **Data leaving the server.** Webhook calls contain the notification texts; the heartbeat only consists of the call itself.
+- **UptimeRobot API key.** The main key gives full access to the UptimeRobot account (monitors, alert contacts). It is stored in `srvmon.cfg` on the flash drive like the webhook ID; the settings page shows it as a password field and the status page never receives it. srvmon passes it to `curl` via a temporary file with mode 0600, not on the command line, so it does not appear in the process list. If the key is leaked, delete it in UptimeRobot and create a new one.
+- **Data leaving the server.** Webhook calls contain the notification texts; the heartbeat only consists of the call itself. With external checks enabled, srvmon sends the configured URLs to UptimeRobot and reads the status of all monitors of the account.
 - **Root privileges.** Plugins run as root. Only install from sources you control. Anyone with write access to the repository behind `pluginURL` can run arbitrary code on the server through an update. Protect the GitHub account with two-factor authentication.
 - **No tokens in the URL.** For private repositories, do not put an access token into `pluginURL`; it would be stored in plain text on the flash drive and in the log.
 - **WebGUI over HTTP.** If the Unraid WebGUI is only reachable via HTTP, the root password travels unencrypted when logging in. Unraid offers HTTPS under *Settings > Management Access*.
@@ -692,6 +749,8 @@ srvmon was developed and tested with simulated Unraid files and tools and has si
 
 | Assumption | How to check |
 |---|---|
+| UptimeRobot API v3 as described in its OpenAPI specification (tested against a replica, not against the real service): monitor list, creating keyword monitors with `tagNames`, deleting | enable the external check, run `check.php --force --dry-run`, then wait for "External check created" |
+| Immich answers `/api/server/ping` with `pong` (path of current versions) | open `https://<immich host>/api/server/ping` in the browser |
 | cron entry is present after a reboot without manual action | after a reboot: `date -d @$(cat /tmp/srvmon/lastrun)` |
 | format of the Docker update file (fields `local` and `remote`) | `head -c 500 /var/lib/docker/unraid-update-status.json` |
 | Docker converts `\t` in `--format` templates to tabs | `docker inspect --format '{{.Name}}\t{{.Image}}' $(docker ps -aq)` must print tab-separated lines |
@@ -720,6 +779,12 @@ srvmon was developed and tested with simulated Unraid files and tools and has si
 ---
 
 ## Changelog
+
+### 2026.10.18o
+- Reachability from the internet via UptimeRobot: srvmon creates and deletes the monitors (presets for Nextcloud and Immich), reads their status and reports outages through its notification chain
+- Local diagnosis during an outage via Nginx Proxy Manager: says whether the problem is on the way from the internet or in the application
+- Status page: new card "Reachability from the internet"
+- New options `CHECK_EXTERNAL`, `UPTIMEROBOT_KEY` and `EXT_MONITORS`
 
 ### 2026.10.18n
 - Notification when a plugin was updated (installed version changed), with old and new version; all plugins of a run in one notification
