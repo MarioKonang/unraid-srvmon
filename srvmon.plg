@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "srvmon">
 <!ENTITY author    "MarioKonang">
-<!ENTITY version   "2026.10.18q">
+<!ENTITY version   "2026.10.19">
 <!ENTITY repo      "https://github.com/MarioKonang/unraid-srvmon">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/MarioKonang/unraid-srvmon/main/srvmon.plg">
 <!ENTITY emhttp    "/usr/local/emhttp/plugins/&name;">
@@ -11,6 +11,11 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" pluginURL="&pluginURL;" min="6.12.0" icon="heartbeat" launch="Settings/srvmon" support="&repo;">
 
 <CHANGES>
+###2026.10.19
+- DynDNS check: public DNS entries compared with the current public IPv4 address (and AAAA with the server's IPv6 addresses)
+- Status page: new card "DynDNS"
+- New options CHECK_DYNDNS, DYNDNS_HOSTS and DYNDNS_IPV6
+
 ###2026.10.18q
 - Fix: performed container updates and network changes were never detected (docker inspect --format does not convert \t); srvmon now reads the JSON output of docker inspect
 
@@ -142,6 +147,9 @@ CERT_IGNORE=""
 CHECK_EXTERNAL="no"
 UPTIMEROBOT_KEY=""
 EXT_MONITORS=""
+CHECK_DYNDNS="yes"
+DYNDNS_HOSTS=""
+DYNDNS_IPV6="yes"
 WEBHOOK_URL=""
 WEBHOOK_LEVEL="warning"
 WEBHOOK_LANG="en"
@@ -623,6 +631,65 @@ function sm_ext_local(array $e): array
     if ($code >= 400) return [false, "HTTP $code via $via"];
     if ($e['keyword'] !== '' && strpos($txt, $e['keyword']) === false) return [false, "HTTP $code via $via, but the expected content is missing"];
     return [true, "HTTP $code via $via"];
+}
+
+// ------------------------------------------------------------ DynDNS
+
+/** Current public IPv4 address of the internet connection (external service, with fallback). null = not determinable. */
+function sm_public_ipv4(): ?string
+{
+    foreach (['https://api.ipify.org', 'https://ipv4.icanhazip.com'] as $url) {
+        $out = []; $rc = 0;
+        exec('curl -4 -sS -m 10 ' . escapeshellarg($url) . ' 2>/dev/null', $out, $rc);
+        $ip = trim(implode('', $out));
+        if ($rc === 0 && filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) return $ip;
+    }
+    return null;
+}
+
+/**
+ * Addresses of a hostname in public DNS via DNS-over-HTTPS (Cloudflare, fallback Google). Deliberately not
+ * the local resolver: the router often answers with the LAN address. [] = no such record, null = query failed.
+ */
+function sm_public_dns(string $host, string $type): ?array
+{
+    $code = $type === 'AAAA' ? 28 : 1;
+    foreach (['https://cloudflare-dns.com/dns-query', 'https://dns.google/resolve'] as $base) {
+        $out = []; $rc = 0;
+        exec('curl -sS -m 10 -H ' . escapeshellarg('accept: application/dns-json') . ' '
+             . escapeshellarg($base . '?name=' . rawurlencode($host) . '&type=' . $type) . ' 2>/dev/null', $out, $rc);
+        $j = json_decode(implode("\n", $out), true);
+        if ($rc !== 0 || !is_array($j) || !isset($j['Status'])) continue;
+        if ((int)$j['Status'] === 3) return [];                       // NXDOMAIN
+        if ((int)$j['Status'] !== 0) continue;
+        $r = [];
+        foreach ($j['Answer'] ?? [] as $a) {
+            if ((int)($a['type'] ?? 0) === $code) $r[] = sm_ip_norm((string)($a['data'] ?? ''));
+        }
+        return array_values(array_unique(array_filter($r, 'strlen')));
+    }
+    return null;
+}
+
+/** Canonical form of an IP address, so that differently written IPv6 addresses compare equal. */
+function sm_ip_norm(string $ip): string
+{
+    $b = @inet_pton(trim($ip));
+    return $b === false ? '' : (string)inet_ntop($b);
+}
+
+/** Public (global, non-ULA, non-deprecated) IPv6 addresses of this server. */
+function sm_local_ipv6(): array
+{
+    $out = []; $rc = 0;
+    exec('ip -6 addr show scope global 2>/dev/null', $out, $rc);
+    $r = [];
+    foreach ($out as $l) {
+        if (!preg_match('#^\s*inet6\s+([0-9a-f:]+)/\d+#i', $l, $m) || stripos($l, 'deprecated') !== false) continue;
+        $ip = sm_ip_norm($m[1]);
+        if ($ip !== '' && !preg_match('/^f[cd]/i', $ip)) $r[] = $ip;  // fc00::/7 = ULA, not reachable from the internet
+    }
+    return array_values(array_unique($r));
 }
 
 // ------------------------------------------------------------ TLS certificates
@@ -1117,6 +1184,33 @@ const SM_TEXTS = [
         'fr' => "srvmon a supprimé le moniteur UptimeRobot pour {url}, car il n'est plus configuré.",
         'es' => "srvmon ha eliminado el monitor de UptimeRobot para {url}, porque ya no está configurado."],
 
+    // ---- DynDNS
+    "DynDNS entry for {h} outdated" => [
+        'de' => "DynDNS-Eintrag für {h} veraltet", 'fr' => "Entrée DynDNS pour {h} obsolète",
+        'es' => "Entrada DynDNS de {h} desactualizada"],
+    "In public DNS, {h} points to {dns}, but the current public IPv4 address is {ip}. The services are not reachable from the internet. Check the DynDNS update in the router or at the DynDNS provider." => [
+        'de' => "Im öffentlichen DNS zeigt {h} auf {dns}, die aktuelle öffentliche IPv4-Adresse ist aber {ip}. Die Dienste sind aus dem Internet nicht erreichbar. DynDNS-Aktualisierung im Router oder beim DynDNS-Anbieter prüfen.",
+        'fr' => "Dans le DNS public, {h} pointe vers {dns}, mais l'adresse IPv4 publique actuelle est {ip}. Les services ne sont pas joignables depuis Internet. Vérifiez la mise à jour DynDNS dans le routeur ou chez le fournisseur DynDNS.",
+        'es' => "En el DNS público, {h} apunta a {dns}, pero la dirección IPv4 pública actual es {ip}. Los servicios no son accesibles desde Internet. Compruebe la actualización DynDNS en el router o en el proveedor de DynDNS."],
+    "DynDNS entry for {h} missing" => [
+        'de' => "DynDNS-Eintrag für {h} fehlt", 'fr' => "Entrée DynDNS pour {h} manquante",
+        'es' => "Falta la entrada DynDNS de {h}"],
+    "{h} has no IPv4 address in public DNS (current public IPv4 address: {ip}). Check the DynDNS update in the router or at the DynDNS provider." => [
+        'de' => "{h} hat im öffentlichen DNS keine IPv4-Adresse (aktuelle öffentliche IPv4-Adresse: {ip}). DynDNS-Aktualisierung im Router oder beim DynDNS-Anbieter prüfen.",
+        'fr' => "{h} n'a pas d'adresse IPv4 dans le DNS public (adresse IPv4 publique actuelle : {ip}). Vérifiez la mise à jour DynDNS dans le routeur ou chez le fournisseur DynDNS.",
+        'es' => "{h} no tiene dirección IPv4 en el DNS público (dirección IPv4 pública actual: {ip}). Compruebe la actualización DynDNS en el router o en el proveedor de DynDNS."],
+    "IPv6 entry for {h} outdated" => [
+        'de' => "IPv6-Eintrag für {h} veraltet", 'fr' => "Entrée IPv6 pour {h} obsolète",
+        'es' => "Entrada IPv6 de {h} desactualizada"],
+    "In public DNS, {h} points to {dns}, but the public IPv6 address of this server is {local}. Devices that prefer IPv6, often phones on mobile data, cannot reach it. Update the AAAA entry, or delete it if IPv6 is not used." => [
+        'de' => "Im öffentlichen DNS zeigt {h} auf {dns}, die öffentliche IPv6-Adresse dieses Servers ist aber {local}. Geräte, die IPv6 bevorzugen, oft Handys im Mobilnetz, erreichen ihn so nicht. AAAA-Eintrag aktualisieren oder löschen, wenn IPv6 nicht genutzt wird.",
+        'fr' => "Dans le DNS public, {h} pointe vers {dns}, mais l'adresse IPv6 publique de ce serveur est {local}. Les appareils qui préfèrent IPv6, souvent les téléphones en données mobiles, ne peuvent pas le joindre. Mettez à jour l'entrée AAAA, ou supprimez-la si IPv6 n'est pas utilisé.",
+        'es' => "En el DNS público, {h} apunta a {dns}, pero la dirección IPv6 pública de este servidor es {local}. Los dispositivos que prefieren IPv6, a menudo móviles con datos móviles, no pueden acceder. Actualice la entrada AAAA o elimínela si no se usa IPv6."],
+    "In public DNS, {h} points to {dns}, but this server has no public IPv6 address. Devices that prefer IPv6, often phones on mobile data, cannot reach it. Update the AAAA entry, or delete it if IPv6 is not used." => [
+        'de' => "Im öffentlichen DNS zeigt {h} auf {dns}, dieser Server hat aber keine öffentliche IPv6-Adresse. Geräte, die IPv6 bevorzugen, oft Handys im Mobilnetz, erreichen ihn so nicht. AAAA-Eintrag aktualisieren oder löschen, wenn IPv6 nicht genutzt wird.",
+        'fr' => "Dans le DNS public, {h} pointe vers {dns}, mais ce serveur n'a pas d'adresse IPv6 publique. Les appareils qui préfèrent IPv6, souvent les téléphones en données mobiles, ne peuvent pas le joindre. Mettez à jour l'entrée AAAA, ou supprimez-la si IPv6 n'est pas utilisé.",
+        'es' => "En el DNS público, {h} apunta a {dns}, pero este servidor no tiene dirección IPv6 pública. Los dispositivos que prefieren IPv6, a menudo móviles con datos móviles, no pueden acceder. Actualice la entrada AAAA o elimínela si no se usa IPv6."],
+
     // ---- updates
     "{n} Docker update(s) available" => [
         'de' => "{n} Docker-Update(s) verfügbar", 'fr' => "{n} mise(s) à jour Docker disponible(s)",
@@ -1293,6 +1387,10 @@ if (sm_on($cfg, 'CHECK_EXTERNAL') && trim((string)($cfg['UPTIMEROBOT_KEY'] ?? ''
     $ext = json_decode((string)@file_get_contents(SM_TMP . '/ext.json'), true);
     $out['ext'] = is_array($ext) ? $ext : null;
 }
+if (sm_on($cfg, 'CHECK_DYNDNS') && sm_list($cfg['DYNDNS_HOSTS'] ?? '')) {
+    $dd = json_decode((string)@file_get_contents(SM_TMP . '/dyndns.json'), true);
+    $out['dyndns'] = is_array($dd) ? $dd : null;
+}
 
 echo json_encode($out, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
 ]]></INLINE>
@@ -1359,6 +1457,7 @@ if (sm_on($cfg, 'CHECK_PLUGIN_UPDATES')) sm_check_plugin_updates($state, $events
 if (sm_on($cfg, 'CHECK_PLUGIN_UPDATED')) sm_check_plugin_updated($state, $events);
 if (sm_on($cfg, 'CHECK_CERTS'))   sm_check_certs($cfg, $force, $state, $issues, $ran);
 if (sm_on($cfg, 'CHECK_EXTERNAL')) sm_check_external($cfg, $state, $issues, $events, $ran);
+if (sm_on($cfg, 'CHECK_DYNDNS'))   sm_check_dyndns($cfg, $state, $issues, $ran);
 
 // ---------------------------------------------------------------- Evaluation
 $now    = time();
@@ -1924,6 +2023,75 @@ function sm_check_external(array $cfg, array &$state, array &$issues, array &$ev
     }
 }
 
+/**
+ * DynDNS: does the public DNS entry of each hostname point to the current public IPv4 address (and the AAAA
+ * entry to an IPv6 address of this server)? Reported only after 3 mismatches in a row, so a reconnect with a
+ * new IP, which the DynDNS update follows within minutes, does not cause an alarm.
+ */
+function sm_check_dyndns(array $cfg, array &$state, array &$issues, array &$ran): void
+{
+    global $dry;
+    $hosts = sm_list($cfg['DYNDNS_HOSTS'] ?? '');
+    if (!$hosts) return;
+    $ip4 = sm_public_ipv4();
+    if ($ip4 === null) { sm_keep($state, $issues, 'dyndns:'); return; }   // offline: decide nothing
+    $ran[] = 'dyndns:';
+    $v6     = sm_on($cfg, 'DYNDNS_IPV6');
+    $local6 = $v6 ? sm_local_ipv6() : [];
+    $cntFile = SM_TMP . '/dyndns_fail.json';                               // RAM: mismatches in a row
+    $cnt    = json_decode((string)@file_get_contents($cntFile), true) ?: [];
+    $next   = [];
+    $items  = [];
+    // count a mismatch; true once it persisted for 3 checks. During the grace period an existing
+    // issue is kept (e.g. counter reset by a reboot), so no false "Resolved" is sent.
+    $persist = function (string $k, bool $bad) use ($cnt, &$next, $state, &$issues): bool {
+        $next[$k] = $bad ? (int)($cnt[$k] ?? 0) + 1 : 0;
+        if ($bad && $next[$k] < 3) sm_keep($state, $issues, 'dyndns:' . $k);
+        return $next[$k] >= 3;
+    };
+    foreach ($hosts as $h) {
+        $a = sm_public_dns($h, 'A');
+        if ($a === null) {                                                 // DNS-over-HTTPS not reachable
+            sm_keep($state, $issues, "dyndns:$h:");
+            foreach (['4', '6'] as $f) if (isset($cnt["$h:$f"])) $next["$h:$f"] = $cnt["$h:$f"];
+            $items[] = ['host' => $h, 'error' => 'Public DNS not reachable'];
+            continue;
+        }
+        $ok4  = in_array($ip4, $a, true);
+        $item = ['host' => $h, 'ip4' => $ip4, 'dns4' => $a, 'ok4' => $ok4];
+        if ($persist("$h:4", !$ok4)) {
+            $issues["dyndns:$h:4"] = $a
+                ? ['alert', "DynDNS entry for $h outdated",
+                   "In public DNS, $h points to " . implode(', ', $a) . ", but the current public IPv4 address is $ip4. The services are not reachable from the internet. Check the DynDNS update in the router or at the DynDNS provider."]
+                : ['alert', "DynDNS entry for $h missing",
+                   "$h has no IPv4 address in public DNS (current public IPv4 address: $ip4). Check the DynDNS update in the router or at the DynDNS provider."];
+        }
+        if ($v6) {
+            $aaaa = sm_public_dns($h, 'AAAA');
+            if ($aaaa === null) {
+                sm_keep($state, $issues, "dyndns:$h:6");
+                if (isset($cnt["$h:6"])) $next["$h:6"] = $cnt["$h:6"];
+            } elseif ($aaaa) {                                             // no AAAA entry = IPv6 not used, fine
+                $ok6 = (bool)array_intersect($aaaa, $local6);
+                $item += ['dns6' => $aaaa, 'local6' => $local6, 'ok6' => $ok6];
+                if ($persist("$h:6", !$ok6)) {
+                    $issues["dyndns:$h:6"] = ['warning', "IPv6 entry for $h outdated",
+                        "In public DNS, $h points to " . implode(', ', $aaaa) . ', but ' . ($local6
+                            ? 'the public IPv6 address of this server is ' . implode(', ', $local6)
+                            : 'this server has no public IPv6 address')
+                        . '. Devices that prefer IPv6, often phones on mobile data, cannot reach it. Update the AAAA entry, or delete it if IPv6 is not used.'];
+                }
+            }
+        }
+        $items[] = $item;
+    }
+    if (!$dry) {
+        @file_put_contents($cntFile, json_encode($next));
+        @file_put_contents(SM_TMP . '/dyndns.json', json_encode(['time' => time(), 'items' => $items],
+            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+    }
+}
+
 function sm_check_updates(array &$state, array &$events): void
 {
     $avail = sm_get_updates();
@@ -2279,6 +2447,15 @@ UptimeRobot API key (main key, secret):
 Services (comma-separated):
 : <input type="text" name="EXT_MONITORS" value="<?=sm_v($sm,'EXT_MONITORS')?>" style="width:30em" placeholder="nextcloud:https://cloud.example.com@192.168.1.10:4443">
 
+Check DynDNS entries:
+: <?=sm_yn($sm,'CHECK_DYNDNS')?>
+
+DynDNS hostnames (comma-separated):
+: <input type="text" name="DYNDNS_HOSTS" value="<?=sm_v($sm,'DYNDNS_HOSTS')?>" style="width:30em" placeholder="cloud.example.com">
+
+Also check IPv6 (AAAA) entries:
+: <?=sm_yn($sm,'DYNDNS_IPV6')?>
+
 <div class="srvmon-sec">Additional notification channels<small>in addition to Unraid's notifications</small></div>
 
 Webhook URL (e.g. Home Assistant):
@@ -2489,6 +2666,18 @@ Markdown="false"
           b+='<tr><td>'+esc(x.name)+(x.managed?'':' <span class="smd-muted">(not managed by srvmon)</span>')+'</td><td>'+chip(x.status||'?',cls)+'</td><td class="smd-muted">'+note+'</td></tr>';});
         b+='</tbody></table></div><div class="smd-muted" style="margin-top:.4em">Checked by UptimeRobot every 5 min · read: '+fmtT(d.ext.time)+'</div>';}
       h+=card('Reachability from the internet',b,true);
+    }
+    if('dyndns' in d){
+      var b;
+      if(!d.dyndns)b='<span class="smd-muted">No DynDNS check has run yet.</span>';
+      else{b='<div class="smd-scroll"><table><thead><tr><th>Hostname</th><th>IPv4 in DNS</th><th>Public IPv4</th><th>IPv6 in DNS</th></tr></thead><tbody>';
+        d.dyndns.items.forEach(function(x){
+          if(x.error){b+='<tr><td>'+esc(x.host)+'</td><td colspan="3" class="smd-warn">'+esc(x.error)+'</td></tr>';return;}
+          var c4=x.ok4?'smd-ok':'smd-crit', v6='<span class="smd-muted">none</span>';
+          if(x.dns6)v6='<span class="'+(x.ok6?'smd-ok':'smd-warn')+'">'+esc(x.dns6.join(', '))+'</span>'+(x.ok6?'':'<br><span class="smd-muted">server: '+esc((x.local6||[]).join(', ')||'no public IPv6')+'</span>');
+          b+='<tr><td>'+esc(x.host)+'</td><td class="'+c4+'">'+esc(x.dns4.join(', ')||'none')+'</td><td>'+esc(x.ip4)+'</td><td>'+v6+'</td></tr>';});
+        b+='</tbody></table></div><div class="smd-muted" style="margin-top:.4em">Checked: '+fmtT(d.dyndns.time)+' · reported after 3 mismatches in a row</div>';}
+      h+=card('DynDNS',b,true);
     }
     document.getElementById('smd-grid').innerHTML=h;
   }

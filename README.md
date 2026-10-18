@@ -2,7 +2,7 @@
 
 srvmon monitors the health of an Unraid server and reports relevant events through Unraid's own notification system (email, push services) and optionally via webhook, for example to Home Assistant for Alexa announcements. It also provides a live status page in the WebGUI.
 
-Version: 2026.10.18q
+Version: 2026.10.19
 Repository: https://github.com/MarioKonang/unraid-srvmon
 Target platform: Unraid 6.12 and newer (used on 7.2.4, see [Verification status](#verification-status))
 
@@ -240,6 +240,24 @@ The local call only happens during an outage. It ignores certificate errors; cer
 **UptimeRobot's own alerts:** srvmon does not assign alert contacts to the monitors it creates. If the whole server or the internet connection is down, srvmon cannot report anything; for that case use the [heartbeat](#heartbeat-outage-of-the-whole-server), or add your email address as alert contact to the monitors in UptimeRobot (then you receive outages twice while the server is running).
 
 **Limits of the free plan:** 50 monitors, check every 5 minutes, 10 API requests per minute. srvmon reads all monitors with one request per run (one more per 200 monitors).
+
+### DynDNS
+
+With a changing public IP address (e.g. a daily reconnect), services are reachable from the internet only as long as the DynDNS entry is updated. If the update fails, the hostname points to an old address. Inside the home network everything keeps working, because the router often resolves the name to the LAN address, so the outage easily goes unnoticed. srvmon compares the public DNS entries with the current addresses.
+
+| Check | Condition | Level |
+|---|---|---|
+| DynDNS entry outdated | the A record of a hostname in `DYNDNS_HOSTS` does not contain the current public IPv4 address | alert |
+| DynDNS entry missing | the hostname has no A record | alert |
+| IPv6 entry outdated | the hostname has an AAAA record that is not a public IPv6 address of this server (only with `DYNDNS_IPV6`) | warning |
+
+A difference is reported only after **3 checks in a row**. After a reconnect with a new IP, the DynDNS update usually follows within minutes; this does not cause an alarm. If the internet connection is down, srvmon decides nothing and keeps the existing state.
+
+**Sources:** the current public IPv4 address comes from `api.ipify.org` (fallback `ipv4.icanhazip.com`). The DNS entries are read from public DNS via DNS-over-HTTPS (Cloudflare, fallback Google), not from the local resolver, because the router may answer with the LAN address. The IPv6 addresses of the server come from `ip -6 addr` (global addresses, without ULA `fc00::/7` and deprecated addresses).
+
+**IPv6:** an AAAA entry must point to the server itself (the Fritzbox forwards IPv6 per device, not via the router address). If no AAAA entry exists, IPv6 is not checked. With Telekom, the IPv6 prefix usually changes together with the IPv4 address. The DynDNS function of the Fritzbox only reports the router's own IPv6 address; if you do not use IPv6 for your services, deleting the AAAA entry is the simplest solution. Set `DYNDNS_IPV6="no"` to check only IPv4.
+
+**Limitations:** with DS-Lite or carrier-grade NAT, the public IPv4 address is shared with other customers and cannot be used for port forwarding; the IPv4 check then reports a permanent difference. If the server's internet traffic goes through a VPN, the detected public IP is that of the VPN.
 
 ---
 
@@ -547,6 +565,9 @@ Changes to the file take effect on the next run; no restart is needed.
 |---|---|---|
 | `CHECK_EXTERNAL` | `no` | reachability from the internet via UptimeRobot on/off |
 | `UPTIMEROBOT_KEY` | empty | main API key of the UptimeRobot account (secret, see [Security](#security)) |
+| `CHECK_DYNDNS` | `yes` | DynDNS check on/off (only active with `DYNDNS_HOSTS`) |
+| `DYNDNS_HOSTS` | empty | hostnames whose public DNS entry must point to this connection, comma-separated, see [DynDNS](#dyndns) |
+| `DYNDNS_IPV6` | `yes` | also check AAAA entries |
 | `EXT_MONITORS` | empty | services to check, comma-separated: `[nextcloud: or immich:]https://host[/path][@LAN-IP:port]`, see [Reachability from the internet](#reachability-from-the-internet-uptimerobot) |
 
 ### Additional notification channels
@@ -672,6 +693,8 @@ The cron job calls the script every minute; the script checks the interval itsel
 | `/tmp/srvmon/certs.json` | result of the last certificate check for the status page |
 | `/tmp/srvmon/ext.json` | result of the last external check for the status page |
 | `/tmp/srvmon/ext_fail` | number of failed UptimeRobot requests in a row |
+| `/tmp/srvmon/dyndns.json` | result of the last DynDNS check for the status page |
+| `/tmp/srvmon/dyndns_fail.json` | number of DynDNS mismatches in a row per hostname |
 
 ---
 
@@ -693,6 +716,7 @@ The cron job calls the script every minute; the script checks the interval itsel
 | Performed plugin updates | `version` attribute of `/var/log/plugins/*.plg` |
 | Certificate files | `openssl x509` on `<CERT_DIRS>/*/fullchain.pem` |
 | Served certificates | `openssl s_client` with SNI and `-verify_hostname` |
+| DynDNS | public IPv4 via `api.ipify.org` / `ipv4.icanhazip.com`, DNS via DNS-over-HTTPS (`cloudflare-dns.com`, `dns.google`), `ip -6 addr` |
 | Reachability from the internet | UptimeRobot API v3 (`https://api.uptimerobot.com/v3/monitors`) via `curl`; local diagnosis with `curl --resolve` |
 | Delivery | `/usr/local/emhttp/webGui/scripts/notify`, `curl` for webhook and heartbeat |
 
@@ -707,7 +731,7 @@ All external calls run with `timeout`, so a hanging service does not block the r
 - **Status page behind the login.** The JSON endpoint lives in the plugin directory of the WebGUI and is therefore protected by the WebGUI login. It does not send disk IDs, which usually contain serial numbers, to the browser.
 - **Webhook ID and heartbeat URL are secrets.** They are stored in `srvmon.cfg` on the flash drive, not in the `.plg`. Do not publish the configuration file. In Home Assistant keep `local_only: true` so the webhook can only be triggered from the local network.
 - **UptimeRobot API key.** The main key gives full access to the UptimeRobot account (monitors, alert contacts). It is stored in `srvmon.cfg` on the flash drive like the webhook ID; the settings page shows it as a password field and the status page never receives it. srvmon passes it to `curl` via a temporary file with mode 0600, not on the command line, so it does not appear in the process list. If the key is leaked, delete it in UptimeRobot and create a new one.
-- **Data leaving the server.** Webhook calls contain the notification texts; the heartbeat only consists of the call itself. With external checks enabled, srvmon sends the configured URLs to UptimeRobot and reads the status of all monitors of the account.
+- **Data leaving the server.** Webhook calls contain the notification texts; the heartbeat only consists of the call itself. With external checks enabled, srvmon sends the configured URLs to UptimeRobot and reads the status of all monitors of the account. With the DynDNS check, the IP lookup services see the public IP of the connection (inherent to the request) and Cloudflare/Google see the checked hostnames.
 - **Root privileges.** Plugins run as root. Only install from sources you control. Anyone with write access to the repository behind `pluginURL` can run arbitrary code on the server through an update. Protect the GitHub account with two-factor authentication.
 - **No tokens in the URL.** For private repositories, do not put an access token into `pluginURL`; it would be stored in plain text on the flash drive and in the log.
 - **WebGUI over HTTP.** If the Unraid WebGUI is only reachable via HTTP, the root password travels unencrypted when logging in. Unraid offers HTTPS under *Settings > Management Access*.
@@ -749,6 +773,7 @@ srvmon was developed and tested with simulated Unraid files and tools and has si
 - webhook to Home Assistant and Alexa announcement
 - format of the OS update check result `/tmp/unraidcheck/result.json` (fields `isNewer`, `version`, `isEligible`, `params.update_exp`) and the downloaded `.plg` files in `/tmp/plugins/` (checked on 7.2.4)
 - update via the *Plugins* tab replaces the program files (since 2026.10.18m)
+- reading the JSON output of `docker inspect`: image IDs and Docker networks per container (since 2026.10.18q)
 
 **Not yet confirmed:**
 
@@ -783,6 +808,11 @@ srvmon was developed and tested with simulated Unraid files and tools and has si
 ---
 
 ## Changelog
+
+### 2026.10.19
+- DynDNS check: compares the public DNS entries of the configured hostnames with the current public IPv4 address (and AAAA entries with the server's IPv6 addresses); reported after 3 mismatches in a row
+- Status page: new card "DynDNS"
+- New options `CHECK_DYNDNS`, `DYNDNS_HOSTS` and `DYNDNS_IPV6`
 
 ### 2026.10.18q
 - Fix: performed container updates and network changes were never detected. `docker inspect --format` does not turn `\t` into tabs, so the fields could not be split and srvmon saw no containers. srvmon now reads the JSON output of `docker inspect`.
