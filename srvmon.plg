@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "srvmon">
 <!ENTITY author    "MarioKonang">
-<!ENTITY version   "2026.10.18o">
+<!ENTITY version   "2026.10.18p">
 <!ENTITY repo      "https://github.com/MarioKonang/unraid-srvmon">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/MarioKonang/unraid-srvmon/main/srvmon.plg">
 <!ENTITY emhttp    "/usr/local/emhttp/plugins/&name;">
@@ -11,6 +11,11 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" pluginURL="&pluginURL;" min="6.12.0" icon="heartbeat" launch="Settings/srvmon" support="&repo;">
 
 <CHANGES>
+###2026.10.18p
+- Notification when a container loses or joins a Docker network (e.g. reverse proxy lost its shared network)
+- Status page: Docker networks per container
+- New option CHECK_DOCKER_NETWORKS
+
 ###2026.10.18o
 - Reachability from the internet via UptimeRobot: monitors are created and deleted by srvmon (presets for Nextcloud and Immich), outages are reported through the srvmon notification chain
 - Local diagnosis during an outage via Nginx Proxy Manager
@@ -106,6 +111,7 @@ CHECK_SYSTEM="yes"
 CHECK_UPS="yes"
 CHECK_UPDATES="yes"
 CHECK_DOCKER_UPDATED="yes"
+CHECK_DOCKER_NETWORKS="yes"
 CHECK_OS_UPDATES="yes"
 CHECK_PLUGIN_UPDATES="yes"
 CHECK_PLUGIN_UPDATED="yes"
@@ -361,31 +367,37 @@ function sm_get_ups(): ?array
 }
 
 /**
- * Image information per container: image ID, image reference and version from labels.
- * Used to detect performed updates (new image ID for the same container).
+ * Information per container: image ID, image reference, version from labels and Docker networks.
+ * Used to detect performed updates (new image ID for the same container) and lost networks.
+ * Cached per run, as two checks use it.
  */
 function sm_get_docker_images(): ?array
 {
+    static $cache = false;
+    if ($cache !== false) return $cache;
     $ids = []; $rc = 0;
     exec('timeout 30 docker ps -aq 2>/dev/null', $ids, $rc);
-    if ($rc !== 0) return null;
+    if ($rc !== 0) return $cache = null;
     $ids = array_filter(array_map('trim', $ids), 'strlen');
-    if (!$ids) return [];
+    if (!$ids) return $cache = [];
     $out = [];
-    $fmt = '{{.Name}}\t{{.Image}}\t{{.Config.Image}}\t{{json .Config.Labels}}';
+    $fmt = '{{.Name}}\t{{.Image}}\t{{.Config.Image}}\t{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}\t{{json .Config.Labels}}';
     exec('timeout 60 docker inspect --format ' . escapeshellarg($fmt) . ' '
          . implode(' ', array_map('escapeshellarg', $ids)) . ' 2>/dev/null', $out, $rc);
-    if ($rc !== 0) return null;              // e.g. container removed meanwhile: retry next run
+    if ($rc !== 0) return $cache = null;     // e.g. container removed meanwhile: retry next run
     $r = [];
     foreach ($out as $line) {
-        $f = explode("\t", $line, 4);
-        if (count($f) < 4) continue;
-        $labels  = json_decode($f[3], true);
+        $f = explode("\t", $line, 5);
+        if (count($f) < 5) continue;
+        $labels  = json_decode($f[4], true);
         $labels  = is_array($labels) ? $labels : [];
         $version = (string)($labels['org.opencontainers.image.version'] ?? $labels['version'] ?? $labels['build_version'] ?? '');
-        $r[ltrim($f[0], '/')] = ['id' => $f[1], 'image' => $f[2], 'version' => preg_match('/^.{0,80}/us', trim($version), $m) ? $m[0] : ''];
+        $nets    = array_values(array_filter(explode(' ', $f[3]), 'strlen'));
+        sort($nets);
+        $r[ltrim($f[0], '/')] = ['id' => $f[1], 'image' => $f[2], 'networks' => $nets,
+                                 'version' => preg_match('/^.{0,80}/us', trim($version), $m) ? $m[0] : ''];
     }
-    return $r;
+    return $cache = $r;
 }
 
 /** Normalise an image reference: a missing tag becomes :latest. */
@@ -879,6 +891,20 @@ const SM_TEXTS = [
     "Container {n}: image changed" => [
         'de' => "Container {n}: Image geändert", 'fr' => "Conteneur {n} : image modifiée",
         'es' => "Contenedor {n}: imagen cambiada"],
+    "Container {n} lost network {net}" => [
+        'de' => "Container {n} hat Netzwerk {net} verloren", 'fr' => "Le conteneur {n} a perdu le réseau {net}",
+        'es' => "El contenedor {n} ha perdido la red {net}"],
+    "Container {n} is no longer connected to network {net} (now: {cur}). Containers that reach others by name through this network, e.g. a reverse proxy, fail then, often with HTTP 502." => [
+        'de' => "Container {n} ist nicht mehr mit Netzwerk {net} verbunden (jetzt: {cur}). Container, die andere über dieses Netzwerk per Namen erreichen, z. B. ein Reverse Proxy, schlagen dann fehl, oft mit HTTP 502.",
+        'fr' => "Le conteneur {n} n'est plus connecté au réseau {net} (maintenant : {cur}). Les conteneurs qui en joignent d'autres par leur nom via ce réseau, p. ex. un reverse proxy, échouent alors, souvent avec HTTP 502.",
+        'es' => "El contenedor {n} ya no está conectado a la red {net} (ahora: {cur}). Los contenedores que acceden a otros por nombre a través de esta red, p. ej. un proxy inverso, fallan entonces, a menudo con HTTP 502."],
+    "Container {n} joined network {net}" => [
+        'de' => "Container {n} mit Netzwerk {net} verbunden", 'fr' => "Le conteneur {n} a rejoint le réseau {net}",
+        'es' => "El contenedor {n} se ha unido a la red {net}"],
+    "Container {n} is now also connected to network {net} (now: {cur})." => [
+        'de' => "Container {n} ist jetzt auch mit Netzwerk {net} verbunden (jetzt: {cur}).",
+        'fr' => "Le conteneur {n} est maintenant aussi connecté au réseau {net} (maintenant : {cur}).",
+        'es' => "El contenedor {n} está ahora también conectado a la red {net} (ahora: {cur})."],
     "Container {n} now uses {new} instead of {old}." => [
         'de' => "Container {n} verwendet jetzt {new} statt {old}.",
         'fr' => "Le conteneur {n} utilise maintenant {new} au lieu de {old}.",
@@ -1227,6 +1253,7 @@ if (sm_on($cfg, 'CHECK_DOCKER')) {
             $c['version']          = $img['version'] ?? '';
             $c['updated']          = $img['updated'] ?? null;
             $c['update_available'] = $img !== null && in_array(sm_norm_image((string)$img['image']), $avail, true);
+            $c['networks']         = $state['docker_net'][$c['name']] ?? null;
         }
         unset($c);
     }
@@ -1320,6 +1347,7 @@ if (sm_on($cfg, 'CHECK_DISKS'))   sm_check_disks($cfg, $state, $issues, $events,
 if (sm_on($cfg, 'CHECK_SPACE'))   sm_check_space($cfg, $issues, $ran);
 if (sm_on($cfg, 'CHECK_DOCKER'))  sm_check_docker($cfg, $state, $issues, $events, $ran);
 if (sm_on($cfg, 'CHECK_DOCKER') && sm_on($cfg, 'CHECK_DOCKER_UPDATED')) sm_check_docker_updated($state, $events);
+if (sm_on($cfg, 'CHECK_DOCKER') && sm_on($cfg, 'CHECK_DOCKER_NETWORKS')) sm_check_docker_networks($state, $events);
 if (sm_on($cfg, 'CHECK_VMS'))     sm_check_vms($cfg, $state, $issues, $events, $ran);
 if (sm_on($cfg, 'CHECK_SYSTEM'))  sm_check_system($cfg, $state, $issues, $events, $ran);
 if (sm_on($cfg, 'CHECK_UPS'))     sm_check_ups($issues, $ran);
@@ -1532,6 +1560,34 @@ function sm_check_docker_updated(array &$state, array &$events): void
         $now[$n] = $e;
     }
     $state['docker_img'] = $now;
+}
+
+/**
+ * Reports when a container loses a Docker network (e.g. a reverse proxy loses the network it shares with
+ * its targets after the container was recreated) or joins a new one. One-off events, so an intended
+ * change does not cause a permanent alarm. New and removed containers are not reported.
+ */
+function sm_check_docker_networks(array &$state, array &$events): void
+{
+    $list = sm_get_docker_images();
+    if ($list === null) return;
+    $prev = $state['docker_net'] ?? [];
+    $now  = [];
+    foreach ($list as $n => $c) {
+        $nets = $c['networks'];
+        $now[$n] = $nets;
+        if (!isset($prev[$n]) || !is_array($prev[$n])) continue;
+        $cur = $nets ? implode(', ', $nets) : 'none';
+        foreach (array_diff($prev[$n], $nets) as $net) {
+            $events[] = ['warning', "Container $n lost network $net",
+                "Container $n is no longer connected to network $net (now: $cur). Containers that reach others by name through this network, e.g. a reverse proxy, fail then, often with HTTP 502."];
+        }
+        foreach (array_diff($nets, $prev[$n]) as $net) {
+            $events[] = ['normal', "Container $n joined network $net",
+                "Container $n is now also connected to network $net (now: $cur)."];
+        }
+    }
+    $state['docker_net'] = $now;
 }
 
 function sm_check_vms(array $cfg, array &$state, array &$issues, array &$events, array &$ran): void
@@ -2154,6 +2210,9 @@ Notify about available updates:
 Notify about performed updates:
 : <?=sm_yn($sm,'CHECK_DOCKER_UPDATED')?>
 
+Notify when a container loses or joins a network:
+: <?=sm_yn($sm,'CHECK_DOCKER_NETWORKS')?>
+
 <div class="srvmon-sec">Unraid OS and plugins<small>uses the result of Unraid's own update checks</small></div>
 
 Notify about Unraid OS updates:
@@ -2351,6 +2410,7 @@ Markdown="false"
         d.docker.forEach(function(c){var w=all||d.docker_watch.indexOf(c.name)>=0,ok=c.state==='running';
           var cls=c.unhealthy?'smd-warn':(ok?'smd-ok':(w?'smd-crit':''));
           var info=(c.version?'v '+esc(c.version):'')+(c.updated?(c.version?' · ':'')+'updated '+fmtT(c.updated):'');
+          if(c.networks&&c.networks.length)info+=(info?' · ':'')+'net: '+esc(c.networks.join(', '));
           b+='<tr><td>'+esc(c.name)+(w&&!all?' <span class="smd-muted">(watched)</span>':'')+'</td><td>'+chip(c.unhealthy?'unhealthy':c.state,cls)+(c.update_available?' '+chip('Update','smd-warn'):'')+'</td><td class="smd-muted">'+esc(c.status)+(info?'<br>'+info:'')+'</td></tr>';});
         b+='</tbody></table></div>';}
       h+=card('Docker',b);

@@ -2,7 +2,7 @@
 
 srvmon monitors the health of an Unraid server and reports relevant events through Unraid's own notification system (email, push services) and optionally via webhook, for example to Home Assistant for Alexa announcements. It also provides a live status page in the WebGUI.
 
-Version: 2026.10.18o
+Version: 2026.10.18p
 Repository: https://github.com/MarioKonang/unraid-srvmon
 Target platform: Unraid 6.12 and newer (used on 7.2.4, see [Verification status](#verification-status))
 
@@ -115,6 +115,8 @@ If apcupsd is not running, the check is skipped.
 | Update available | Unraid's update check reports a newer remote image (once per new update, with container names) | normal |
 | Container updated | an existing container runs with a new image ID and the same image reference (one-off event, with old and new version if available) | normal |
 | Image changed | an existing container uses a different image reference, e.g. another tag (one-off event) | normal |
+| Network lost | an existing container is no longer connected to a Docker network it was connected to before (one-off event) | warning |
+| Network joined | an existing container is connected to an additional Docker network (one-off event) | normal |
 
 **Available updates:** srvmon does not query registries itself but reads the result of Unraid's own update check. How current this information is depends on its schedule, which you set under *Settings > Notifications*.
 
@@ -125,6 +127,8 @@ Not reported as an update:
 - recreating a container with an unchanged image, e.g. after editing the template,
 - renamed or newly created containers (no previous state),
 - updates that happen while srvmon is not installed.
+
+**Networks:** srvmon remembers the Docker networks of every container. A typical failure: a reverse proxy such as Nginx Proxy Manager reaches its targets by container name through a shared network. If the proxy container is recreated (update, template change) or a Compose stack recreates its network, a network connected later with `docker network connect` is lost. The proxy then cannot resolve the names and answers with `502 Bad Gateway`. srvmon reports the lost network when it happens, not only when users notice the outage. Both notifications are one-off events, so an intended change causes no permanent alarm. New and removed containers are not reported. The status page shows the networks per container.
 
 **Important:** all update notifications have the level `normal`. To receive them by email, the email agent for **Notices** must be enabled under *Settings > Notifications*.
 
@@ -401,7 +405,7 @@ The page is located under *Settings > User Utilities > Server Monitor Status*. I
 - UPS: status, charge, time left and load,
 - storage space as a bar per path,
 - disks as a table with status, temperature, errors and SMART values,
-- Docker and VMs with their state, watched entries are marked; for containers additionally an "Update" hint, the image version and the time of the last detected update,
+- Docker and VMs with their state, watched entries are marked; for containers additionally an "Update" hint, the image version, the time of the last detected update and the Docker networks,
 - available Docker updates,
 - Unraid OS and plugin updates: installed OS version, available OS version, plugins with installed and available version, time of Unraid's last check, plugins updated in the last 7 days,
 - TLS certificates with source (file or live), expiry date, days left, issuer and notes. These come from the last hourly check; the time is shown below the table.
@@ -520,6 +524,7 @@ Changes to the file take effect on the next run; no restart is needed.
 | `CHECK_UPS` | `yes` | UPS via apcupsd |
 | `CHECK_UPDATES` | `yes` | notify about available Docker updates |
 | `CHECK_DOCKER_UPDATED` | `yes` | notify about performed container updates (only together with `CHECK_DOCKER`) |
+| `CHECK_DOCKER_NETWORKS` | `yes` | notify when a container loses or joins a Docker network (only together with `CHECK_DOCKER`) |
 | `CHECK_OS_UPDATES` | `yes` | notify about available Unraid OS updates |
 | `CHECK_PLUGIN_UPDATES` | `yes` | notify about available plugin updates |
 | `CHECK_PLUGIN_UPDATED` | `yes` | notify about performed plugin updates |
@@ -652,7 +657,7 @@ The cron job calls the script every minute; the script checks the interval itsel
 | `/boot/config/plugins/srvmon.plg` | plugin definition, installed by Unraid on boot |
 | `/boot/config/plugins/srvmon/srvmon.cfg` | your settings |
 | `/boot/config/plugins/srvmon/srvmon.cron` | cron entry |
-| `/boot/config/plugins/srvmon/state.json` | active problems, SMART baseline, last known container and VM states, image ID and version per container, known Docker, OS and plugin updates, installed plugin versions with time of the last update |
+| `/boot/config/plugins/srvmon/state.json` | active problems, SMART baseline, last known container and VM states, image ID and version per container, known Docker, OS and plugin updates, installed plugin versions with time of the last update, Docker networks per container |
 
 `state.json` is only written when its content actually changes, to spare the flash drive.
 
@@ -677,7 +682,7 @@ The cron job calls the script every minute; the script checks the interval itsel
 | Disks | `/var/local/emhttp/disks.ini` |
 | SMART | `smartctl -n standby -j -H -A /dev/<device>` |
 | Storage space | `mountpoint -q` and the PHP functions `disk_total_space` and `disk_free_space` |
-| Docker | `docker ps -a`, `docker inspect` (image ID, image reference, labels) |
+| Docker | `docker ps -a`, `docker inspect` (image ID, image reference, networks, labels) |
 | VMs | `virsh list --all --name`, `virsh domstate` |
 | CPU, RAM, uptime | `/proc/loadavg`, `/proc/meminfo`, `/proc/uptime`, `nproc` |
 | Reboot | `/proc/sys/kernel/random/boot_id` |
@@ -754,6 +759,7 @@ srvmon was developed and tested with simulated Unraid files and tools and has si
 | cron entry is present after a reboot without manual action | after a reboot: `date -d @$(cat /tmp/srvmon/lastrun)` |
 | format of the Docker update file (fields `local` and `remote`) | `head -c 500 /var/lib/docker/unraid-update-status.json` |
 | Docker converts `\t` in `--format` templates to tabs | `docker inspect --format '{{.Name}}\t{{.Image}}' $(docker ps -aq)` must print tab-separated lines |
+| network list from `docker inspect` (`range` over `.NetworkSettings.Networks`) | `docker inspect --format '{{.Name}}: {{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' $(docker ps -aq)` |
 | plugin attributes `icon`, `launch` and `support` are evaluated in the plugin list | check the plugin list: icon, clickable name, support link |
 | header `Markdown="false"` on the status page | open the status page and check for rendering errors |
 
@@ -779,6 +785,11 @@ srvmon was developed and tested with simulated Unraid files and tools and has si
 ---
 
 ## Changelog
+
+### 2026.10.18p
+- Notification when a container loses or joins a Docker network, e.g. a reverse proxy that lost the network shared with its targets after it was recreated
+- Status page: Docker networks per container
+- New option `CHECK_DOCKER_NETWORKS`
 
 ### 2026.10.18o
 - Reachability from the internet via UptimeRobot: srvmon creates and deletes the monitors (presets for Nextcloud and Immich), reads their status and reports outages through its notification chain
