@@ -12,7 +12,7 @@ srvmon monitors the health of an Unraid server and the reachability of its servi
 - **Overview:** status page and dashboard tile with selectable sections
 - **Light on resources:** spun-down disks are not woken up, the flash drive is only written on changes
 
-Version: 2026.10.20a
+Version: 2026.10.20b
 Repository: https://github.com/MarioKonang/unraid-srvmon
 Target platform: Unraid 6.12 and newer (used on 7.2.4, see [Verification status](#verification-status))
 
@@ -905,6 +905,9 @@ srvmon was developed and tested with simulated Unraid files and tools and has si
 ---
 
 ## Changelog
+
+### 2026.10.20b
+- README: examples use the generic server name `Tower`
 
 ### 2026.10.20a
 - Dashboard tile: own CSS class names, so Unraid's styles no longer colour headings and values (orange heading, yellow box) or truncate labels
