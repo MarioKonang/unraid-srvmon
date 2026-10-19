@@ -12,7 +12,9 @@ srvmon monitors the health of an Unraid server and the reachability of its servi
 - **Overview:** status page and dashboard tile with selectable sections
 - **Light on resources:** spun-down disks are not woken up, the flash drive is only written on changes
 
-Version: 2026.10.20b
+<p align="center"><img src="docs/dashboard-tile.png" alt="srvmon dashboard tile showing problems, CPU and RAM, disks, storage space, Docker, VMs, updates, certificates, reachability and DynDNS" width="420"><br><em>Dashboard tile (example data)</em></p>
+
+Version: 2026.10.20c
 Repository: https://github.com/MarioKonang/unraid-srvmon
 Target platform: Unraid 6.12 and newer (used on 7.2.4, see [Verification status](#verification-status))
 
@@ -494,6 +496,8 @@ The settings page *Server Monitor* additionally shows a short list of active pro
 
 srvmon adds a **Server Monitor** tile to the Unraid dashboard. Like the built-in tiles, it can be shown, hidden and moved with the content manager of the dashboard (the tile is placed in the third column by default).
 
+<p align="center"><img src="docs/dashboard-tile.png" alt="srvmon dashboard tile showing problems, CPU and RAM, disks, storage space, Docker, VMs, updates, certificates, reachability and DynDNS" width="420"></p>
+
 The header shows a summary ("All good" or the number of critical problems and warnings) and the time of the last check, with links to the status page and the settings. Below, the tile shows the sections selected in the settings (*Dashboard tile*, option `DASH_SECTIONS`) in a compact form:
 
 | Section | Shown |
@@ -905,6 +909,9 @@ srvmon was developed and tested with simulated Unraid files and tools and has si
 ---
 
 ## Changelog
+
+### 2026.10.20c
+- README: screenshot of the dashboard tile (example data)
 
 ### 2026.10.20b
 - README: examples use the generic server name `Tower`
