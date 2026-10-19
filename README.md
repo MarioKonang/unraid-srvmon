@@ -2,7 +2,7 @@
 
 srvmon monitors the health of an Unraid server and reports relevant events through Unraid's own notification system (email, push services) and optionally via webhook, for example to Home Assistant for Alexa announcements. It also provides a live status page in the WebGUI.
 
-Version: 2026.10.19c
+Version: 2026.10.20
 Repository: https://github.com/MarioKonang/unraid-srvmon
 Target platform: Unraid 6.12 and newer (used on 7.2.4, see [Verification status](#verification-status))
 
@@ -480,6 +480,28 @@ SMART values are not read live for the page; it shows the state of the last chec
 
 The settings page *Server Monitor* additionally shows a short list of active problems.
 
+### Dashboard tile
+
+srvmon adds a **Server Monitor** tile to the Unraid dashboard. Like the built-in tiles, it can be shown, hidden and moved with the content manager of the dashboard (the tile is placed in the third column by default).
+
+The header shows a summary ("All good" or the number of critical problems and warnings) and the time of the last check, with links to the status page and the settings. Below, the tile shows the sections selected in the settings (*Dashboard tile*, option `DASH_SECTIONS`) in a compact form:
+
+| Section | Shown |
+|---|---|
+| Active problems | up to 6 problems with level |
+| CPU and RAM | 5-minute load and RAM usage with bars |
+| Disks | number (and how many are in standby), problems, highest temperature, I/O errors |
+| Storage space | usage and free space per path |
+| Docker | running containers, problems (unhealthy, watched and stopped), available updates |
+| VMs | running and crashed VMs |
+| UPS | status, charge and time left |
+| Unraid OS and plugin updates | available OS version, plugin updates, plugins updated in the last 7 days |
+| TLS certificates | next expiring certificate |
+| Reachability from the internet | status per UptimeRobot monitor |
+| DynDNS | status per hostname |
+
+The tile reloads its data every 60 seconds while the browser tab is visible. It only collects the selected sections, so unselected sections cause no load (e.g. no `docker ps` for a tile without Docker).
+
 ---
 
 ## Installation
@@ -630,6 +652,12 @@ Changes to the file take effect on the next run; no restart is needed.
 | `ALEXA_LANG` | `en` | language of the Alexa notification text: `en`, `de`, `fr` or `es` |
 | `HEARTBEAT_URL` | empty | called via GET on every check run; empty = off |
 
+### Dashboard tile
+
+| Key | Default | Description |
+|---|---|---|
+| `DASH_SECTIONS` | `issues,system,disks,space,docker,ext` | sections of the dashboard tile, comma-separated: `issues`, `system`, `disks`, `space`, `docker`, `vms`, `ups`, `sysupd`, `certs`, `ext`, `dyndns` |
+
 ### Thresholds
 
 | Key | Default | Description |
@@ -721,6 +749,7 @@ The cron job calls the script every minute; the script checks the interval itsel
 | `/usr/local/emhttp/plugins/srvmon/scripts/check.php` | check script |
 | `/usr/local/emhttp/plugins/srvmon/srvmon.page` | settings page |
 | `/usr/local/emhttp/plugins/srvmon/SrvmonStatus.page` | status page |
+| `/usr/local/emhttp/plugins/srvmon/SrvmonDash.page` | dashboard tile |
 
 ### Persistent files (flash)
 
@@ -835,6 +864,7 @@ srvmon was developed and tested with simulated Unraid files and tools and has si
 
 | Assumption | How to check |
 |---|---|
+| dashboard tile: appears in the content manager and in the dashboard; layout (header markup of Unraid 7, may look slightly different on 6.12) | open the dashboard, enable *Server Monitor* in the content manager if necessary |
 | yellow ring and chime on the Echo for srvmon notifications: in the first test the notification arrived, but without ring (cause unclear: do not disturb, device type or app setting) | run `check.php --test` during the day without do not disturb and watch the Echo |
 | Immich answers `/api/server/ping` with `pong` (path of current versions) | open `https://<immich host>/api/server/ping` in the browser |
 | cron entry is present after a reboot without manual action | after a reboot: `date -d @$(cat /tmp/srvmon/lastrun)` |
@@ -864,6 +894,11 @@ srvmon was developed and tested with simulated Unraid files and tools and has si
 ---
 
 ## Changelog
+
+### 2026.10.20
+- Dashboard tile "Server Monitor": summary and the sections selected in the settings (problems, CPU/RAM, disks, storage space, Docker, VMs, UPS, OS and plugin updates, certificates, reachability, DynDNS); shown, hidden and moved via the dashboard's content manager
+- `data.php` accepts `?only=` to collect only the requested sections
+- New option `DASH_SECTIONS`
 
 ### 2026.10.19c
 - README: Alexa notifications confirmed on the server (German wording), troubleshooting extended (notification accepted but not visible, do not disturb, Echo Show)

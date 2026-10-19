@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "srvmon">
 <!ENTITY author    "MarioKonang">
-<!ENTITY version   "2026.10.19c">
+<!ENTITY version   "2026.10.20">
 <!ENTITY repo      "https://github.com/MarioKonang/unraid-srvmon">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/MarioKonang/unraid-srvmon/main/srvmon.plg">
 <!ENTITY emhttp    "/usr/local/emhttp/plugins/&name;">
@@ -11,6 +11,10 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" pluginURL="&pluginURL;" min="6.12.0" icon="heartbeat" launch="Settings/srvmon" support="&repo;">
 
 <CHANGES>
+###2026.10.20
+- Dashboard tile "Server Monitor" with selectable sections (settings: Dashboard tile)
+- New option DASH_SECTIONS
+
 ###2026.10.19c
 - Documentation: Alexa notifications confirmed, troubleshooting extended
 
@@ -114,7 +118,7 @@ rm -rf &emhttp;
 <FILE Name="&emhttp;/README.md">
 <INLINE><![CDATA[**Server Monitor (srvmon)**
 
-Monitors disks, SMART, storage space, Docker containers and updates, Unraid OS and plugin updates, VMs, system, UPS and TLS certificates and reports problems via Unraid's notifications. Settings and live status under Settings > User Utilities.
+Monitors disks, SMART, storage space, Docker containers and updates, Unraid OS and plugin updates, VMs, system, UPS, TLS certificates and reachability from the internet and reports problems via Unraid's notifications, webhook and Alexa. Settings and live status under Settings > User Utilities, plus a dashboard tile.
 ]]></INLINE>
 </FILE>
 
@@ -169,6 +173,7 @@ ALEXA_REGION="eu"
 ALEXA_LEVEL="warning"
 ALEXA_LANG="en"
 HEARTBEAT_URL=""
+DASH_SECTIONS="issues,system,disks,space,docker,ext"
 ]]></INLINE>
 </FILE>
 
@@ -191,6 +196,14 @@ const SM_OS_CHECK    = '/tmp/unraidcheck/result.json';    // result of Unraid's 
 const SM_OS_IGNORED  = '/tmp/unraidcheck/ignored.json';   // releases ignored in the Update OS dialog
 const SM_PLG_NEW     = '/tmp/plugins';                    // .plg files downloaded by Unraid's plugin check
 const SM_PLG_LOCAL   = '/var/log/plugins';                // installed plugins
+
+// Sections of the dashboard tile (DASH_SECTIONS): key => label; keys are also the "only" filter of data.php
+const SM_DASH_SECTIONS = [
+    'issues' => 'Active problems',   'system' => 'CPU and RAM',      'disks'  => 'Disks',
+    'space'  => 'Storage space',     'docker' => 'Docker',           'vms'    => 'VMs',
+    'ups'    => 'UPS',               'sysupd' => 'Unraid OS and plugin updates',
+    'certs'  => 'TLS certificates',  'ext'    => 'Reachability from the internet', 'dyndns' => 'DynDNS',
+];
 
 // Watched ATA counters: id => [label, level on increase]
 const SM_ATA_WATCH = [
@@ -1395,9 +1408,10 @@ function sm_tr(string $text, string $lang, int $depth = 0): string
 <FILE Name="&emhttp;/include/data.php">
 <INLINE><![CDATA[<?php
 /*
- * srvmon - JSON endpoint for the status page.
+ * srvmon - JSON endpoint for the status page and the dashboard tile.
  * Located under /plugins/srvmon/include/ and therefore protected by the WebGUI login.
  * SMART is NOT read live here (too slow); the last state from check.php is shown instead.
+ * ?only=system,disks,... limits the (partly expensive) collectors to the given sections; issues are always included.
  */
 declare(strict_types=1);
 require_once '/usr/local/emhttp/plugins/srvmon/include/lib.php';
@@ -1408,6 +1422,8 @@ header('Cache-Control: no-store');
 $cfg    = sm_load_cfg();
 $state  = sm_load_state();
 $status = json_decode((string)@file_get_contents(SM_TMP . '/status.json'), true) ?: [];
+$only   = isset($_GET['only']) ? array_flip(sm_list((string)$_GET['only'])) : null;
+$need   = fn(string $s): bool => $only === null || isset($only[$s]);
 
 // current descriptions from the last run (RAM); after a reboot, before the first run: the stored state
 $issues = [];
@@ -1431,10 +1447,10 @@ $out = [
     ],
 ];
 
-if (sm_on($cfg, 'CHECK_SYSTEM')) $out['system'] = sm_get_system();
+if (sm_on($cfg, 'CHECK_SYSTEM') && $need('system')) $out['system'] = sm_get_system();
 unset($out['system']['boot_id']);
 
-if (sm_on($cfg, 'CHECK_DISKS')) {
+if (sm_on($cfg, 'CHECK_DISKS') && $need('disks')) {
     $disks = sm_get_disks();
     if ($disks !== null) {
         foreach ($disks as &$d) {
@@ -1445,8 +1461,8 @@ if (sm_on($cfg, 'CHECK_DISKS')) {
     }
     $out['disks'] = $disks;
 }
-if (sm_on($cfg, 'CHECK_SPACE'))   $out['space']  = sm_get_space(sm_list($cfg['SPACE_PATHS'] ?? ''));
-if (sm_on($cfg, 'CHECK_DOCKER')) {
+if (sm_on($cfg, 'CHECK_SPACE') && $need('space')) $out['space']  = sm_get_space(sm_list($cfg['SPACE_PATHS'] ?? ''));
+if (sm_on($cfg, 'CHECK_DOCKER') && $need('docker')) {
     $out['docker']       = sm_get_docker();
     $out['docker_watch'] = sm_list($cfg['DOCKER_WATCH'] ?? '');
     if (is_array($out['docker'])) {
@@ -1461,13 +1477,13 @@ if (sm_on($cfg, 'CHECK_DOCKER')) {
         unset($c);
     }
 }
-if (sm_on($cfg, 'CHECK_VMS')) {
+if (sm_on($cfg, 'CHECK_VMS') && $need('vms')) {
     $out['vms']      = sm_get_vms();
     $out['vm_watch'] = sm_list($cfg['VM_WATCH'] ?? '');
 }
-if (sm_on($cfg, 'CHECK_UPS'))     $out['ups']     = sm_get_ups();
-if (sm_on($cfg, 'CHECK_UPDATES')) $out['updates'] = sm_get_updates();
-if (sm_on($cfg, 'CHECK_OS_UPDATES') || sm_on($cfg, 'CHECK_PLUGIN_UPDATES') || sm_on($cfg, 'CHECK_PLUGIN_UPDATED')) {
+if (sm_on($cfg, 'CHECK_UPS') && $need('ups')) $out['ups']     = sm_get_ups();
+if (sm_on($cfg, 'CHECK_UPDATES') && $need('docker')) $out['updates'] = sm_get_updates();
+if ((sm_on($cfg, 'CHECK_OS_UPDATES') || sm_on($cfg, 'CHECK_PLUGIN_UPDATES') || sm_on($cfg, 'CHECK_PLUGIN_UPDATED')) && $need('sysupd')) {
     $out['sysupd'] = ['os_current' => sm_os_version()];
     if (sm_on($cfg, 'CHECK_OS_UPDATES'))     $out['sysupd']['os']      = sm_get_os_update();
     if (sm_on($cfg, 'CHECK_PLUGIN_UPDATES')) $out['sysupd']['plugins'] = sm_get_plugin_updates();
@@ -1483,18 +1499,18 @@ if (sm_on($cfg, 'CHECK_OS_UPDATES') || sm_on($cfg, 'CHECK_PLUGIN_UPDATES') || sm
         $out['sysupd']['recent'] = $recent;
     }
 }
-if (sm_on($cfg, 'CHECK_CERTS')) {
+if (sm_on($cfg, 'CHECK_CERTS') && $need('certs')) {
     // result of the last check run; no TLS handshakes on every page load
     $certs = json_decode((string)@file_get_contents(SM_TMP . '/certs.json'), true);
     $out['certs'] = is_array($certs) ? $certs : null;
     $out['thresholds']['cert'] = [sm_num($cfg, 'CERT_WARN_DAYS', 20), sm_num($cfg, 'CERT_CRIT_DAYS', 7)];
 }
-if (sm_on($cfg, 'CHECK_EXTERNAL') && trim((string)($cfg['UPTIMEROBOT_KEY'] ?? '')) !== '') {
+if (sm_on($cfg, 'CHECK_EXTERNAL') && trim((string)($cfg['UPTIMEROBOT_KEY'] ?? '')) !== '' && $need('ext')) {
     // result of the last check run; the API key never goes to the browser
     $ext = json_decode((string)@file_get_contents(SM_TMP . '/ext.json'), true);
     $out['ext'] = is_array($ext) ? $ext : null;
 }
-if (sm_on($cfg, 'CHECK_DYNDNS') && sm_list($cfg['DYNDNS_HOSTS'] ?? '')) {
+if (sm_on($cfg, 'CHECK_DYNDNS') && sm_list($cfg['DYNDNS_HOSTS'] ?? '') && $need('dyndns')) {
     $dd = json_decode((string)@file_get_contents(SM_TMP . '/dyndns.json'), true);
     $out['dyndns'] = is_array($dd) ? $dd : null;
 }
@@ -2418,7 +2434,17 @@ $sm = array_merge(
 );
 $smStatus = json_decode((string)@file_get_contents('/tmp/srvmon/status.json'), true) ?: [];
 require_once '/usr/local/emhttp/plugins/srvmon/include/lang.php';
+require_once '/usr/local/emhttp/plugins/srvmon/include/lib.php';
 if (!function_exists('sm_v')) {
+    function sm_dashsel(array $c): string {
+        $cur = array_flip(sm_list($c['DASH_SECTIONS'] ?? ''));
+        $o = '<input type="hidden" name="DASH_SECTIONS" id="smDashSec" value="' . htmlspecialchars((string)($c['DASH_SECTIONS'] ?? ''), ENT_QUOTES) . '">';
+        foreach (SM_DASH_SECTIONS as $k => $t) {
+            $o .= '<label style="display:inline-block;margin:0 1.2em .3em 0;white-space:nowrap"><input type="checkbox" class="smDashCb" value="' . $k . '"'
+                . (isset($cur[$k]) ? ' checked' : '') . ' onchange="smDashUpd()"> ' . htmlspecialchars($t) . '</label>';
+        }
+        return $o;
+    }
     function sm_langsel(array $c, string $k): string {
         $cur = (string)($c[$k] ?? 'en');
         $o = '';
@@ -2446,6 +2472,12 @@ if (!function_exists('sm_v')) {
     }
 }
 ?>
+<script>
+function smDashUpd(){
+  var v=[];document.querySelectorAll('.smDashCb').forEach(function(c){if(c.checked)v.push(c.value);});
+  document.getElementById('smDashSec').value=v.join(',');
+}
+</script>
 <style>
 .srvmon-sec{font-weight:bold;font-size:1.1em;margin:2.2em 0 .9em;padding-bottom:.35em;border-bottom:1px solid rgba(127,127,127,.4)}
 .srvmon-sec.first{margin-top:.5em}
@@ -2482,6 +2514,11 @@ Notify when a problem is resolved:
 
 Language of Unraid notifications:
 : <?=sm_langsel($sm,'NOTIFY_LANG')?>
+
+<div class="srvmon-sec">Dashboard tile<small>show or hide the tile itself via the content manager of the dashboard</small></div>
+
+Sections shown in the tile:
+: <?=sm_dashsel($sm)?>
 
 <div class="srvmon-sec">Disks and SMART</div>
 
@@ -2848,6 +2885,137 @@ Markdown="false"
   setInterval(function(){if(!document.hidden)load();},REFRESH);
 })();
 </script>
+]]></INLINE>
+</FILE>
+
+<FILE Name="&emhttp;/SrvmonDash.page">
+<INLINE><![CDATA[Menu="Dashboard:0"
+Markdown="false"
+Cond="version_compare(parse_ini_file('/etc/unraid-version')['version'],'6.11.9','>')"
+---
+<?php
+/*
+ * srvmon - tile for the Unraid dashboard (shown, hidden and moved via the dashboard's content manager).
+ * The sections are selected in the srvmon settings (DASH_SECTIONS). Data comes from include/data.php,
+ * limited to these sections; refresh every 60 s while the page is visible.
+ */
+require_once '/usr/local/emhttp/plugins/srvmon/include/lib.php';
+$smDashCfg = sm_load_cfg();
+$smDashSec = array_values(array_intersect(sm_list($smDashCfg['DASH_SECTIONS'] ?? ''), array_keys(SM_DASH_SECTIONS)));
+$mytiles['srvmon']['column3'] = str_replace('@@SECTIONS@@', htmlspecialchars(implode(',', $smDashSec), ENT_QUOTES), <<<'EOT'
+<tbody title="Server Monitor" id="smdash" data-sections="@@SECTIONS@@">
+<tr><td>
+  <span class="tile-header">
+    <span class="tile-header-left">
+      <i class="fa fa-heartbeat f32"></i>
+      <div class="section">
+        <h3 class="tile-header-main">Server Monitor</h3>
+        <span id="smdash-sum">Loading …</span>
+      </div>
+    </span>
+    <span class="tile-header-right">
+      <span class="tile-header-right-controls">
+        <a href="/Settings/SrvmonStatus" title="Server Monitor Status"><i class="fa fa-fw fa-external-link control"></i></a>
+        <a href="/Settings/srvmon" title="Server Monitor settings"><i class="fa fa-fw fa-cog control"></i></a>
+      </span>
+    </span>
+  </span>
+</td></tr>
+<tr><td><div id="smdash-body" class="smdash"></div></td></tr>
+<style>
+.smdash{--ok:#3b8c2a;--warn:#c98a00;--crit:#c0392b;--soft:rgba(127,127,127,.15)}
+.smdash .r{display:flex;justify-content:space-between;gap:.8em;margin:.15em 0}
+.smdash .r>span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.smdash .h{font-weight:bold;margin:.6em 0 .2em}
+.smdash .bar{height:6px;background:var(--soft);border-radius:3px;overflow:hidden;margin:.1em 0 .35em}
+.smdash .bar>span{display:block;height:100%}
+.smdash .ok{color:var(--ok)}.smdash .warn{color:var(--warn)}.smdash .crit{color:var(--crit)}.smdash .m{opacity:.7}
+#smdash-sum .b{display:inline-block;padding:0 .45em;border-radius:3px;color:#fff;font-weight:bold;font-size:.9em}
+</style>
+<script>
+(function(){
+  var tile=document.getElementById('smdash'); if(!tile)return;
+  var SEC=(tile.getAttribute('data-sections')||'').split(',').filter(Boolean);
+  var URL='/plugins/srvmon/include/data.php?only='+encodeURIComponent(SEC.join(','));
+  function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+  function col(c){return c==='crit'?'var(--crit)':(c==='warn'?'var(--warn)':'var(--ok)');}
+  function cls(v,w,c){return v==null?'':(v>=c?'crit':(v>=w?'warn':'ok'));}
+  function bar(p,c){p=Math.max(0,Math.min(100,p||0));return '<div class="bar"><span style="width:'+p+'%;background:'+col(c)+'"></span></div>';}
+  function row(l,r,c){return '<div class="r"><span>'+l+'</span><span class="'+(c||'')+'">'+r+'</span></div>';}
+  function head(t){return '<div class="h">'+esc(t)+'</div>';}
+  function fmtB(b){if(b==null)return '–';var u=['B','KB','MB','GB','TB','PB'],i=0;b=Number(b);while(b>=1024&&i<u.length-1){b/=1024;i++;}return b.toFixed(1)+' '+u[i];}
+  function hm(ts){if(!ts)return '–';var d=new Date(ts*1000);return ('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2);}
+  var R={
+    issues:function(d){
+      if(!d.issues.length)return head('Active problems')+row('None','✔','ok');
+      var h=head('Active problems');
+      d.issues.slice(0,6).forEach(function(i){h+=row(esc(i.subject),i.level==='alert'?'alert':'warning',i.level==='alert'?'crit':'warn');});
+      if(d.issues.length>6)h+=row('<span class="m">and '+(d.issues.length-6)+' more</span>','');
+      return h;},
+    system:function(d){if(!d.system)return '';var s=d.system,t=d.thresholds,lc=cls(s.load_pct,t.cpu,1e9),mc=cls(s.mem_pct,t.ram,1e9);
+      return head('CPU and RAM')+row('CPU (5 min)',(s.load_pct==null?'–':s.load_pct.toFixed(0))+' %',lc)+bar(s.load_pct,lc)
+        +row('RAM',(s.mem_pct==null?'–':s.mem_pct.toFixed(0))+' %',mc)+bar(s.mem_pct,mc);},
+    disks:function(d){if(!('disks' in d))return '';if(!d.disks)return head('Disks')+row('disks.ini not readable','');
+      var t=d.thresholds,n=d.disks.length,bad=0,err=0,sb=0,max=null,mc='ok';
+      d.disks.forEach(function(k){if(k.status!=='DISK_OK')bad++;err+=k.errors;if(k.smart&&k.smart.passed===false)bad++;
+        if(k.temp==null){if(k.type!=='Flash')sb++;return;}if(k.type==='Flash')return;
+        var th=k.nvme?t.nvme:t.hdd,c=cls(k.temp,th[0],th[1]);if(c==='crit'||(c==='warn'&&mc==='ok'))mc=c;if(max==null||k.temp>max)max=k.temp;});
+      return head('Disks')+row(n+' disks'+(sb?' <span class="m">('+sb+' in standby)</span>':''),bad?bad+' problem(s)':'OK',bad?'crit':'ok')
+        +row('Highest temperature',max==null?'–':max+' °C',max==null?'':mc)+(err?row('I/O errors',err,'crit'):'');},
+    space:function(d){if(!d.space)return '';var t=d.thresholds,h=head('Storage space');
+      if(!d.space.length)return h+row('<span class="m">nothing mounted</span>','');
+      d.space.forEach(function(p){var c=cls(p.pct,t.space[0],t.space[1]);h+=row(esc(p.path),p.pct.toFixed(0)+' % · '+fmtB(p.free)+' free',c)+bar(p.pct,c);});return h;},
+    docker:function(d){if(!('docker' in d))return '';if(!d.docker)return head('Docker')+row('Docker not reachable','','m');
+      var run=0,bad=[],upd=0,all=d.docker_watch.indexOf('*')>=0;
+      d.docker.forEach(function(c){if(c.state==='running')run++;if(c.update_available)upd++;
+        if(c.unhealthy||(!all&&d.docker_watch.indexOf(c.name)>=0&&c.state!=='running'))bad.push(c.name);});
+      var h=head('Docker')+row('Running',run+' of '+d.docker.length,bad.length?'crit':'ok');
+      if(bad.length)h+=row('Problem','<span title="'+esc(bad.join(', '))+'">'+esc(bad.slice(0,3).join(', '))+(bad.length>3?' …':'')+'</span>','crit');
+      if(upd)h+=row('Updates available',upd,'warn');return h;},
+    vms:function(d){if(!('vms' in d))return '';if(!d.vms)return head('VMs')+row('VM service not reachable','','m');
+      var run=d.vms.filter(function(v){return v.state==='running';}).length,cr=d.vms.filter(function(v){return v.state==='crashed';}).length;
+      return head('VMs')+row('Running',run+' of '+d.vms.length,cr?'crit':'ok')+(cr?row('Crashed',cr,'crit'):'');},
+    ups:function(d){if(!('ups' in d))return '';if(!d.ups)return head('UPS')+row('No UPS data','','m');
+      var u=d.ups,c=/ONBATT|COMMLOST|REPLACEBATT|LOWBATT/i.test(u.status)?'crit':'ok';
+      return head('UPS')+row('Status',esc(u.status||'?'),c)+row('Charge / time left',esc((u.charge||'–')+' / '+(u.timeleft||'–')));},
+    sysupd:function(d){if(!d.sysupd)return '';var s=d.sysupd,h=head('Unraid OS and plugins');
+      if('os' in s){var o=s.os;h+=row('Unraid OS '+esc(s.os_current||'?'),!o?'not checked yet':(o.version&&!o.ignored?esc(o.version)+' available'+(o.eligible===false?' (not eligible)':''):'up to date'),o&&o.version&&!o.ignored?'warn':(o?'ok':'m'));}
+      if('plugins' in s){var p=s.plugins,n=p?Object.keys(p.updates).length:0;h+=row('Plugins',!p?'not checked yet':(n?n+' update(s)':'up to date'),!p?'m':(n?'warn':'ok'));}
+      if(s.recent&&s.recent.length)h+=row('Updated (7 days)',s.recent.length+' plugin(s)','m');return h;},
+    certs:function(d){if(!('certs' in d))return '';var h=head('TLS certificates');if(!d.certs||!d.certs.items.length)return h+row('<span class="m">no data yet</span>','');
+      var ct=d.thresholds.cert||[20,7],next=null,err=0;
+      d.certs.items.forEach(function(c){if(c.error)err++;else if(!c.superseded&&c.days!=null&&(next==null||c.days<next.days))next=c;});
+      if(next)h+=row('Next expiry: '+esc(next.name),next.days+' days',next.days<=ct[1]?'crit':(next.days<=ct[0]?'warn':'ok'));
+      if(err)h+=row('Errors',err,'warn');return h;},
+    ext:function(d){if(!('ext' in d))return '';var h=head('Reachability from the internet');if(!d.ext||!d.ext.items.length)return h+row('<span class="m">no data yet</span>','');
+      d.ext.items.forEach(function(x){h+=row(esc(x.name),esc(x.status||'?'),x.status==='DOWN'?'crit':(x.status==='UP'?'ok':(x.status==='LOOKS_DOWN'?'warn':'m')));});return h;},
+    dyndns:function(d){if(!('dyndns' in d))return '';var h=head('DynDNS');if(!d.dyndns)return h+row('<span class="m">no data yet</span>','');
+      d.dyndns.items.forEach(function(x){h+=row(esc(x.host),x.error?esc(x.error):(x.ok4&&x.ok6!==false?'OK':(x.ok4?'IPv6 outdated':'outdated')),x.error?'warn':(x.ok4&&x.ok6!==false?'ok':(x.ok4?'warn':'crit')));});return h;}
+  };
+  function render(d){
+    var crit=d.issues.filter(function(i){return i.level==='alert';}).length,warn=d.issues.length-crit;
+    var s=crit?'<span class="b" style="background:#c0392b">'+crit+' critical</span> ':'';
+    s+=warn?'<span class="b" style="background:#c98a00">'+warn+' warning'+(warn>1?'s':'')+'</span> ':'';
+    if(!crit&&!warn)s='<span class="b" style="background:#3b8c2a">All good</span> ';
+    document.getElementById('smdash-sum').innerHTML=s+'<span class="m">checked '+hm(d.lastrun)+'</span>';
+    var h='';SEC.forEach(function(k){if(R[k])h+=R[k](d);});
+    document.getElementById('smdash-body').innerHTML=h||'<span class="m">No sections selected (Settings &gt; Server Monitor).</span>';
+  }
+  function load(){
+    var x=new XMLHttpRequest();x.open('GET',URL,true);
+    x.onload=function(){try{if(x.status!==200)throw new Error('HTTP '+x.status);render(JSON.parse(x.responseText));}
+      catch(e){document.getElementById('smdash-sum').innerHTML='<span class="crit">Could not load data ('+esc(e.message)+')</span>';}};
+    x.onerror=function(){document.getElementById('smdash-sum').textContent='Could not load data';};
+    x.send();
+  }
+  load();
+  setInterval(function(){if(!document.hidden)load();},60000);
+})();
+</script>
+</tbody>
+EOT
+);
+?>
 ]]></INLINE>
 </FILE>
 
