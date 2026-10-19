@@ -1,8 +1,18 @@
 # srvmon – Server Monitor for Unraid
 
-srvmon monitors the health of an Unraid server and reports relevant events through Unraid's own notification system (email, push services) and optionally via webhook, for example to Home Assistant for Alexa announcements. It also provides a live status page in the WebGUI.
+srvmon monitors the health of an Unraid server and the reachability of its services, and reports problems through Unraid's own notification system (email, push services), optionally also via webhook (e.g. Home Assistant for Alexa announcements) and as Alexa notifications with the yellow ring. A live status page and a dashboard tile show the current state.
 
-Version: 2026.10.20
+**At a glance**
+
+- **Hardware and system:** disk status, I/O errors, temperatures, SMART, storage space, CPU load, RAM, reboots, UPS
+- **Docker and VMs:** stopped, unhealthy or missing containers, lost Docker networks, crashed VMs
+- **Updates:** available and performed Docker, Unraid OS and plugin updates
+- **Services from outside:** TLS certificates (Nginx Proxy Manager), reachability from the internet via UptimeRobot with local diagnosis, DynDNS entries
+- **Notifications:** Unraid notifications, webhook, Alexa notifications; reminders and "Resolved" messages; English, German, French or Spanish
+- **Overview:** status page and dashboard tile with selectable sections
+- **Light on resources:** spun-down disks are not woken up, the flash drive is only written on changes
+
+Version: 2026.10.20a
 Repository: https://github.com/MarioKonang/unraid-srvmon
 Target platform: Unraid 6.12 and newer (used on 7.2.4, see [Verification status](#verification-status))
 
@@ -13,7 +23,7 @@ Target platform: Unraid 6.12 and newer (used on 7.2.4, see [Verification status]
 1. [Features](#features)
 2. [Notification logic](#notification-logic)
 3. [Additional notification channels](#additional-notification-channels)
-4. [Status page](#status-page)
+4. [Status page and dashboard tile](#status-page)
 5. [Installation](#installation)
 6. [Configuration](#configuration)
 7. [Command line](#command-line)
@@ -857,6 +867,7 @@ srvmon was developed and tested with simulated Unraid files and tools and has si
 - update via the *Plugins* tab replaces the program files (since 2026.10.18m)
 - reading the JSON output of `docker inspect`: image IDs and Docker networks per container (since 2026.10.18q)
 - DynDNS check: public IP via ipify and DNS-over-HTTPS detect an outdated DynDNS entry and a wrong AAAA entry; "Resolved" after the correction (since 2026.10.19)
+- dashboard tile: shown in the dashboard with the header of the built-in tiles, sections selectable (since 2026.10.20, layout fix 2026.10.20a)
 - Alexa notifications: skill manifest upload with ASK CLI in a temporary container, token and Proactive Events API accepted by Amazon, notification read out on request (German: "Neue Nachricht von Server Tower: …") (since 2026.10.19a)
 - external check with the real UptimeRobot API v3: creating keyword monitors with tag, reading the status, `DOWN` with local diagnosis via Nginx Proxy Manager, "Resolved" after recovery (since 2026.10.18o)
 
@@ -864,7 +875,7 @@ srvmon was developed and tested with simulated Unraid files and tools and has si
 
 | Assumption | How to check |
 |---|---|
-| dashboard tile: appears in the content manager and in the dashboard; layout (header markup of Unraid 7, may look slightly different on 6.12) | open the dashboard, enable *Server Monitor* in the content manager if necessary |
+| layout of the dashboard tile on Unraid 6.12 (header markup of Unraid 7) | open the dashboard on 6.12 |
 | yellow ring and chime on the Echo for srvmon notifications: in the first test the notification arrived, but without ring (cause unclear: do not disturb, device type or app setting) | run `check.php --test` during the day without do not disturb and watch the Echo |
 | Immich answers `/api/server/ping` with `pong` (path of current versions) | open `https://<immich host>/api/server/ping` in the browser |
 | cron entry is present after a reboot without manual action | after a reboot: `date -d @$(cat /tmp/srvmon/lastrun)` |
@@ -894,6 +905,9 @@ srvmon was developed and tested with simulated Unraid files and tools and has si
 ---
 
 ## Changelog
+
+### 2026.10.20a
+- Dashboard tile: own CSS class names, so Unraid's styles no longer colour headings and values (orange heading, yellow box) or truncate labels
 
 ### 2026.10.20
 - Dashboard tile "Server Monitor": summary and the sections selected in the settings (problems, CPU/RAM, disks, storage space, Docker, VMs, UPS, OS and plugin updates, certificates, reachability, DynDNS); shown, hidden and moved via the dashboard's content manager
