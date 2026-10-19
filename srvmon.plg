@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "srvmon">
 <!ENTITY author    "MarioKonang">
-<!ENTITY version   "2026.10.19">
+<!ENTITY version   "2026.10.19a">
 <!ENTITY repo      "https://github.com/MarioKonang/unraid-srvmon">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/MarioKonang/unraid-srvmon/main/srvmon.plg">
 <!ENTITY emhttp    "/usr/local/emhttp/plugins/&name;">
@@ -11,6 +11,10 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" pluginURL="&pluginURL;" min="6.12.0" icon="heartbeat" launch="Settings/srvmon" support="&repo;">
 
 <CHANGES>
+###2026.10.19a
+- Alexa notifications (yellow ring) via an own private skill and Amazon's Proactive Events API
+- New options ALEXA_CLIENT_ID, ALEXA_CLIENT_SECRET, ALEXA_REGION, ALEXA_LEVEL and ALEXA_LANG
+
 ###2026.10.19
 - DynDNS check: public DNS entries compared with the current public IPv4 address (and AAAA with the server's IPv6 addresses)
 - Status page: new card "DynDNS"
@@ -153,6 +157,11 @@ DYNDNS_IPV6="yes"
 WEBHOOK_URL=""
 WEBHOOK_LEVEL="warning"
 WEBHOOK_LANG="en"
+ALEXA_CLIENT_ID=""
+ALEXA_CLIENT_SECRET=""
+ALEXA_REGION="eu"
+ALEXA_LEVEL="warning"
+ALEXA_LANG="en"
 HEARTBEAT_URL=""
 ]]></INLINE>
 </FILE>
@@ -633,6 +642,95 @@ function sm_ext_local(array $e): array
     return [true, "HTTP $code via $via"];
 }
 
+// ------------------------------------------------------------ Alexa notifications (yellow ring)
+
+const SM_ALEXA_TOKEN_URL = 'https://api.amazon.com/auth/o2/token';
+const SM_ALEXA_API = ['eu' => 'https://api.eu.amazonalexa.com', 'na' => 'https://api.amazonalexa.com', 'fe' => 'https://api.fe.amazonalexa.com'];
+
+/** Write a temporary file readable only by root (secrets must not appear on the command line). */
+function sm_secret_file(string $content): string
+{
+    @mkdir(SM_TMP, 0755, true);
+    $f = tempnam(SM_TMP, 'sec');
+    @chmod($f, 0600);
+    file_put_contents($f, $content);
+    return $f;
+}
+
+/** POST via curl; returns [http_code, decoded JSON or null, raw body / curl error]. */
+function sm_curl_post(string $url, string $headers, string $body): array
+{
+    $h = sm_secret_file($headers);
+    $b = sm_secret_file($body);
+    $out = []; $rc = 0;
+    exec('curl -sS -m 20 -X POST -H @' . escapeshellarg($h) . ' --data-binary @' . escapeshellarg($b)
+         . " -w '\\n%{http_code}' " . escapeshellarg($url) . ' 2>&1', $out, $rc);
+    @unlink($h); @unlink($b);
+    $code = (int)array_pop($out);
+    $txt  = trim(implode("\n", $out));
+    if ($rc !== 0) return [0, null, $txt !== '' ? $txt : "curl exit code $rc"];
+    $j = json_decode($txt, true);
+    return [$code, is_array($j) ? $j : null, $txt];
+}
+
+/**
+ * Access token for the Proactive Events API (Login with Amazon, client credentials).
+ * Cached in RAM until shortly before it expires; the cache is bound to the client ID.
+ */
+function sm_alexa_token(string $id, string $secret, bool $refresh, ?string &$err): ?string
+{
+    $cache = SM_TMP . '/alexa_token.json';
+    $c = json_decode((string)@file_get_contents($cache), true);
+    if (!$refresh && is_array($c) && ($c['id'] ?? '') === sha1($id) && (int)($c['expires'] ?? 0) > time()) return (string)$c['token'];
+    [$code, $j, $raw] = sm_curl_post(SM_ALEXA_TOKEN_URL, "Content-Type: application/x-www-form-urlencoded\n",
+        http_build_query(['grant_type' => 'client_credentials', 'client_id' => $id, 'client_secret' => $secret,
+                          'scope' => 'alexa::proactive_events']));
+    if ($code !== 200 || !isset($j['access_token'])) {
+        $err = 'token: ' . ($code ? "HTTP $code " . ($j['error_description'] ?? $j['error'] ?? '') : $raw);
+        return null;
+    }
+    $tmp = sm_secret_file((string)json_encode(['id' => sha1($id), 'token' => $j['access_token'],
+                                                'expires' => time() + (int)($j['expires_in'] ?? 3600) - 120]));
+    @rename($tmp, $cache);
+    return (string)$j['access_token'];
+}
+
+/**
+ * Send an Alexa notification: the ring of all Echo devices of the household lights up yellow until the user
+ * asks "Alexa, what are my notifications?". Amazon only allows the template "You have a new message from <text>",
+ * so the text goes into the creator name (max. 256 characters).
+ */
+function sm_alexa_notify(array $cfg, string $text, ?string &$err): bool
+{
+    $id  = trim((string)($cfg['ALEXA_CLIENT_ID'] ?? ''));
+    $sec = trim((string)($cfg['ALEXA_CLIENT_SECRET'] ?? ''));
+    $api = SM_ALEXA_API[strtolower(trim((string)($cfg['ALEXA_REGION'] ?? 'eu')))] ?? SM_ALEXA_API['eu'];
+    $text = trim($text);
+    if (preg_match('/^.{257}/us', $text) && preg_match('/^.{253}/us', $text, $m)) $text = $m[0] . '...';
+    $now = time();
+    $event = [
+        'timestamp'   => gmdate('Y-m-d\TH:i:s.000\Z', $now),
+        'referenceId' => bin2hex(random_bytes(16)),
+        'expiryTime'  => gmdate('Y-m-d\TH:i:s.000\Z', $now + 86400 - 60),   // Amazon: 5 min to 24 h
+        'event' => ['name' => 'AMAZON.MessageAlert.Activated', 'payload' => [
+            'state'        => ['status' => 'UNREAD', 'freshness' => 'NEW'],
+            'messageGroup' => ['creator' => ['name' => $text], 'count' => 1, 'urgency' => 'URGENT'],
+        ]],
+        'relevantAudience' => ['type' => 'Multicast', 'payload' => (object)[]],
+    ];
+    $body = (string)json_encode($event, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    for ($try = 0; $try < 2; $try++) {
+        $token = sm_alexa_token($id, $sec, $try > 0, $err);
+        if ($token === null) return false;
+        [$code, $j, $raw] = sm_curl_post($api . '/v1/proactiveEvents/stages/development',
+            "Authorization: Bearer $token\nContent-Type: application/json\n", $body);
+        if ($code >= 200 && $code < 300) return true;
+        if ($code !== 401) break;                                          // 401: token revoked, fetch a new one
+    }
+    $err = 'event: ' . ($code ? "HTTP $code " . ($j['message'] ?? substr($raw, 0, 200)) : $raw);
+    return false;
+}
+
 // ------------------------------------------------------------ DynDNS
 
 /** Current public IPv4 address of the internet connection (external service, with fallback). null = not determinable. */
@@ -848,6 +946,8 @@ const SM_TEXTS = [
     "Notice from server {host}: {@s}" => [
         'de' => "Hinweis von Server {host}: {@s}", 'fr' => "Information du serveur {host} : {@s}",
         'es' => "Notificación del servidor {host}: {@s}"],
+    "Server {host}: {@s}" => [
+        'de' => "Server {host}: {@s}", 'fr' => "Serveur {host} : {@s}", 'es' => "Servidor {host}: {@s}"],
     "{n} more notifications" => [
         'de' => "{n} weitere Benachrichtigungen", 'fr' => "{n} autres notifications", 'es' => "{n} notificaciones más"],
     "Details in the Unraid notifications." => [
@@ -1416,6 +1516,7 @@ require_once '/usr/local/emhttp/plugins/srvmon/include/lang.php';
 
 const SM_MAX_PER_RUN = 10;
 const SM_MAX_HOOKS   = 3;     // webhook calls per run, so a voice assistant does not talk for minutes
+const SM_MAX_ALEXA   = 5;     // Alexa notifications per run, the rest is summarised
 
 $opt   = getopt('', ['force', 'dry-run', 'test']);
 $force = isset($opt['force']);
@@ -2181,18 +2282,22 @@ function sm_check_plugin_updated(array &$state, array &$events): void
 
 function sm_send(string $lvl, string $subj, string $desc, bool $forceHook = false): void
 {
-    global $dry, $cfg, $smHookSent, $smHookSkipped;
+    global $dry, $cfg, $smHookSent, $smHookSkipped, $smAlexaSent, $smAlexaSkipped;
     $url  = trim((string)($cfg['WEBHOOK_URL'] ?? ''));
     $hook = $url !== '' && ($forceHook || sm_rank($lvl) >= sm_rank((string)($cfg['WEBHOOK_LEVEL'] ?? 'warning')));
+    $alx  = sm_alexa_on($cfg) && ($forceHook || sm_rank($lvl) >= sm_rank((string)($cfg['ALEXA_LEVEL'] ?? 'warning')));
     $nl   = sm_lang($cfg, 'NOTIFY_LANG');    // Unraid notification
     $wl   = sm_lang($cfg, 'WEBHOOK_LANG');   // webhook; the syslog always stays English
+    $al   = sm_lang($cfg, 'ALEXA_LANG');     // Alexa notification
     $host  = gethostname() ?: 'Unraid';
     $intro = ['alert' => 'Alert', 'warning' => 'Warning'][$lvl] ?? 'Notice';
     $speech = "$intro from server $host: $subj";
+    $ring   = "Server $host: $subj";        // Alexa reads: "You have a new message from <ring>"
     if ($dry) {
-        echo "[$lvl] $subj - $desc" . ($hook ? ' [+Webhook]' : '') . "\n";
+        echo "[$lvl] $subj - $desc" . ($hook ? ' [+Webhook]' : '') . ($alx ? ' [+Alexa]' : '') . "\n";
         if ($nl !== 'en') echo "    Unraid ($nl): " . sm_tr($subj, $nl) . ' - ' . sm_tr($desc, $nl) . "\n";
         if ($hook && $wl !== 'en') echo "    Webhook ($wl): " . sm_tr($speech, $wl) . "\n";
+        if ($alx) echo "    Alexa ($al): " . sm_tr($ring, $al) . "\n";
         return;
     }
 
@@ -2204,6 +2309,15 @@ function sm_send(string $lvl, string $subj, string $desc, bool $forceHook = fals
         . ' >/dev/null 2>&1');
     exec('logger -t srvmon ' . escapeshellarg("[$lvl] $subj - $desc"));
 
+    if ($alx) {
+        if ((int)$smAlexaSent >= SM_MAX_ALEXA) {
+            $smAlexaSkipped = (int)$smAlexaSkipped + 1;
+        } else {
+            $smAlexaSent = (int)$smAlexaSent + 1;
+            sm_alexa_send(sm_tr($ring, $al), $forceHook);
+        }
+    }
+
     if (!$hook) return;
     if ((int)$smHookSent >= SM_MAX_HOOKS) { $smHookSkipped = (int)$smHookSkipped + 1; return; }
     $smHookSent = (int)$smHookSent + 1;
@@ -2214,10 +2328,29 @@ function sm_send(string $lvl, string $subj, string $desc, bool $forceHook = fals
     ]);
 }
 
-/** After sending: summarise skipped webhook notifications in one call. */
+function sm_alexa_on(array $cfg): bool
+{
+    return trim((string)($cfg['ALEXA_CLIENT_ID'] ?? '')) !== '' && trim((string)($cfg['ALEXA_CLIENT_SECRET'] ?? '')) !== '';
+}
+
+/** Send an Alexa notification; failures are logged (and printed for --test), the other channels are not affected. */
+function sm_alexa_send(string $text, bool $verbose = false): void
+{
+    global $cfg;
+    $err = null;
+    $ok  = sm_alexa_notify($cfg, $text, $err);
+    if (!$ok) exec('logger -t srvmon ' . escapeshellarg("Alexa notification failed ($err)"));
+    if ($verbose) echo $ok ? "Alexa notification sent: $text\n" : "Alexa notification failed: $err\n";
+}
+
+/** After sending: summarise skipped webhook and Alexa notifications in one call each. */
 function sm_webhook_flush(): void
 {
-    global $dry, $cfg, $smHookSkipped;
+    global $dry, $cfg, $smHookSkipped, $smAlexaSkipped;
+    if (!$dry && (int)$smAlexaSkipped > 0) {
+        $host = gethostname() ?: 'Unraid';
+        sm_alexa_send(sm_tr("Server $host: $smAlexaSkipped more notifications", sm_lang($cfg, 'ALEXA_LANG')));
+    }
     if ($dry || (int)$smHookSkipped === 0) return;
     $host = gethostname() ?: 'Unraid';
     $wl   = sm_lang($cfg, 'WEBHOOK_LANG');
@@ -2466,6 +2599,21 @@ Send webhook for:
 
 Webhook language:
 : <?=sm_langsel($sm,'WEBHOOK_LANG')?>
+
+Alexa notifications – Client ID (yellow ring, see README):
+: <input type="text" name="ALEXA_CLIENT_ID" value="<?=sm_v($sm,'ALEXA_CLIENT_ID')?>" style="width:30em" autocomplete="off" placeholder="amzn1.application-oa2-client....">
+
+Alexa notifications – Client Secret:
+: <input type="password" name="ALEXA_CLIENT_SECRET" value="<?=sm_v($sm,'ALEXA_CLIENT_SECRET')?>" style="width:30em" autocomplete="off">
+
+Alexa region:
+: <select name="ALEXA_REGION"><?php foreach (['eu' => 'Europe (incl. Germany, UK)', 'na' => 'North America', 'fe' => 'Far East (Japan, Australia)'] as $smR => $smT): ?><option value="<?=$smR?>"<?=($sm['ALEXA_REGION'] ?? 'eu') === $smR ? ' selected' : ''?>><?=$smT?></option><?php endforeach; ?></select>
+
+Send Alexa notification for:
+: <?=sm_lvl($sm,'ALEXA_LEVEL')?>
+
+Alexa notification language:
+: <?=sm_langsel($sm,'ALEXA_LANG')?>
 
 Heartbeat URL (external outage monitoring):
 : <input type="text" name="HEARTBEAT_URL" value="<?=sm_v($sm,'HEARTBEAT_URL')?>" style="width:30em" placeholder="https://hc-ping.com/...">

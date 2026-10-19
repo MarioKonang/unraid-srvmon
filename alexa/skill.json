@@ -1,0 +1,70 @@
+{
+  "manifest": {
+    "apis": {
+      "custom": {
+        "endpoint": {
+          "uri": "arn:aws:lambda:us-east-1:318883658404:function:ReflectorTemplateSkill"
+        }
+      }
+    },
+    "permissions": [
+      {
+        "name": "alexa::devices:all:notifications:write"
+      }
+    ],
+    "events": {
+      "endpoint": {
+        "uri": "arn:aws:lambda:us-east-1:318883658404:function:ReflectorTemplateSkill"
+      },
+      "publications": [
+        {
+          "eventName": "AMAZON.MessageAlert.Activated"
+        }
+      ]
+    },
+    "manifestVersion": "1.0",
+    "publishingInformation": {
+      "category": "SMART_HOME",
+      "distributionCountries": [],
+      "isAvailableWorldwide": true,
+      "locales": {
+        "de-DE": {
+          "name": "Server Monitor",
+          "summary": "Benachrichtigungen von srvmon",
+          "description": "Privater Skill: srvmon meldet Probleme des Unraid-Servers als Alexa-Benachrichtigung.",
+          "examplePhrases": ["Alexa, was sind meine Benachrichtigungen?"],
+          "keywords": []
+        },
+        "en-US": {
+          "name": "Server Monitor",
+          "summary": "Notifications from srvmon",
+          "description": "Private skill: srvmon reports problems of the Unraid server as Alexa notifications.",
+          "examplePhrases": ["Alexa, what are my notifications?"],
+          "keywords": []
+        },
+        "en-GB": {
+          "name": "Server Monitor",
+          "summary": "Notifications from srvmon",
+          "description": "Private skill: srvmon reports problems of the Unraid server as Alexa notifications.",
+          "examplePhrases": ["Alexa, what are my notifications?"],
+          "keywords": []
+        },
+        "fr-FR": {
+          "name": "Server Monitor",
+          "summary": "Notifications de srvmon",
+          "description": "Skill privé : srvmon signale les problèmes du serveur Unraid sous forme de notifications Alexa.",
+          "examplePhrases": ["Alexa, quelles sont mes notifications ?"],
+          "keywords": []
+        },
+        "es-ES": {
+          "name": "Server Monitor",
+          "summary": "Notificaciones de srvmon",
+          "description": "Skill privada: srvmon informa de los problemas del servidor Unraid como notificaciones de Alexa.",
+          "examplePhrases": ["Alexa, ¿cuáles son mis notificaciones?"],
+          "keywords": []
+        }
+      },
+      "testingInstructions": "Private skill for proactive notifications from srvmon."
+    }
+  }
+}

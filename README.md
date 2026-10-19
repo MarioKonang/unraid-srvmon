@@ -2,7 +2,7 @@
 
 srvmon monitors the health of an Unraid server and reports relevant events through Unraid's own notification system (email, push services) and optionally via webhook, for example to Home Assistant for Alexa announcements. It also provides a live status page in the WebGUI.
 
-Version: 2026.10.19
+Version: 2026.10.19a
 Repository: https://github.com/MarioKonang/unraid-srvmon
 Target platform: Unraid 6.12 and newer (used on 7.2.4, see [Verification status](#verification-status))
 
@@ -400,6 +400,45 @@ Rules:
 
 **Limitation:** if Home Assistant runs as a container on the same Unraid server, this channel fails together with Docker or the server. That is what the heartbeat is for. You can watch the Home Assistant container itself via `DOCKER_WATCH`; that notification then arrives by email or push, not via Alexa.
 
+### Alexa notifications (yellow ring)
+
+Instead of (or in addition to) a voice announcement via the webhook, srvmon can send an **Alexa notification**: the ring of the Echo devices lights up yellow with a short chime until someone asks *"Alexa, what are my notifications?"*. Nothing is missed when nobody is in the room, and nobody is woken up at night.
+
+A useful combination: `WEBHOOK_LEVEL="alert"` (only alerts are announced immediately) and `ALEXA_LEVEL="warning"` (warnings and alerts additionally light the ring).
+
+**What Alexa says:** Amazon does not allow free text for notifications, only fixed templates. srvmon uses the message template, so Alexa says roughly: *"From Server Monitor: you have a new message from **Server Tower: Disk disk1: temperature critical**"*. The summary of the notification (in `ALEXA_LANG`) is used; long descriptions do not fit. Maximum 256 characters.
+
+**How it works:** srvmon uses Amazon's official Proactive Events API through a private skill of your own. The skill stays in development mode; it is not published and not reviewed by Amazon. srvmon calls Amazon directly; no Home Assistant and no additional container is needed. The approach and the skill manifest follow the project [Alexa-Notify-Bridge](https://github.com/R91g/Alexa-Notify-Bridge) (MIT license).
+
+**Limitations:**
+
+- The ring lights up on **all** Echo devices of the household; Amazon does not allow targeting a single device.
+- With **Alexa+**, the ring and the chime may not appear (reported by the Alexa-Notify-Bridge project).
+- Notifications expire after 24 hours.
+- At most 5 notifications per run; further ones are summarised ("… more notifications").
+
+**Setup** (once, about 15 minutes):
+
+1. **Create the skill:** in the [Alexa Developer Console](https://developer.amazon.com/alexa/console/ask), sign in with the Amazon account your Echo devices use, and create a skill: name `Server Monitor`, primary language German (or your language), model *Custom*, hosting *Provision your own*, template *Start from Scratch*. Note the **Skill ID** (`amzn1.ask.skill....`).
+2. **Upload the manifest:** the notification permission can only be set with Amazon's command line tool (ASK CLI). It runs as a temporary container directly on the Unraid server; nothing is installed permanently. In the Unraid terminal:
+   ```bash
+   mkdir -p /tmp/alexa-skill && curl -fsSL -o /tmp/alexa-skill/skill.json https://raw.githubusercontent.com/MarioKonang/unraid-srvmon/main/alexa/skill.json
+   ```
+   ```bash
+   docker run -it --rm -v /tmp/alexa-skill:/skill node:lts-alpine sh -c "npm install -g ask-cli && ask configure --no-browser && ask smapi update-skill-manifest -s <SKILL_ID> -g development --manifest file:/skill/skill.json"
+   ```
+   `ask configure` shows a link: open it in the browser, sign in with the developer account and paste the code shown there. Answer the question about an AWS account with *No*. Replace `<SKILL_ID>` with the ID from step 1.
+3. **Get the credentials:** in the Developer Console open the skill, *Build > Permissions*. At the bottom of the page (*Alexa Skill Messaging*) you find the **Alexa Client Id** and the **Alexa Client Secret**.
+4. **Enable the skill:** in the Alexa app: *More > Skills & Games > Your Skills > Dev*, open *Server Monitor*, *Enable to use* and allow **notifications**.
+5. **Configure srvmon:** enter Client ID and Client Secret in the settings (section *Additional notification channels*), region *Europe* for Germany, the level and the language, then *Apply*.
+6. **Test:**
+   ```bash
+   php /usr/local/emhttp/plugins/srvmon/scripts/check.php --test
+   ```
+   The output says "Alexa notification sent" or the error returned by Amazon. The Echo ring should light up yellow.
+
+If no ring appears although the test reports success: check in the Alexa app under *More > Settings > Notifications* that notifications of *Server Monitor* are allowed, and that the Echo is not in *Do not disturb* mode.
+
 ### Heartbeat (outage of the whole server)
 
 Monitoring that runs on the server cannot report the server's own total failure. Therefore srvmon calls the `HEARTBEAT_URL` on every check run. An external service raises an alarm when these calls stop.
@@ -577,6 +616,11 @@ Changes to the file take effect on the next run; no restart is needed.
 | `WEBHOOK_URL` | empty | target for webhook calls (HTTP POST with JSON); empty = off |
 | `WEBHOOK_LEVEL` | `warning` | minimum level for webhooks: `normal` (everything), `warning` (warnings and alerts) or `alert` |
 | `WEBHOOK_LANG` | `en` | language of the webhook texts: `en`, `de`, `fr` or `es` |
+| `ALEXA_CLIENT_ID` | empty | Client ID of your private Alexa skill (see [Alexa notifications](#alexa-notifications-yellow-ring)); empty = off |
+| `ALEXA_CLIENT_SECRET` | empty | Client Secret of the skill (secret) |
+| `ALEXA_REGION` | `eu` | Amazon region: `eu` (Europe incl. Germany and UK), `na` (North America), `fe` (Far East) |
+| `ALEXA_LEVEL` | `warning` | minimum level for Alexa notifications: `normal`, `warning` or `alert` |
+| `ALEXA_LANG` | `en` | language of the Alexa notification text: `en`, `de`, `fr` or `es` |
 | `HEARTBEAT_URL` | empty | called via GET on every check run; empty = off |
 
 ### Thresholds
@@ -695,6 +739,7 @@ The cron job calls the script every minute; the script checks the interval itsel
 | `/tmp/srvmon/ext_fail` | number of failed UptimeRobot requests in a row |
 | `/tmp/srvmon/dyndns.json` | result of the last DynDNS check for the status page |
 | `/tmp/srvmon/dyndns_fail.json` | number of DynDNS mismatches in a row per hostname |
+| `/tmp/srvmon/alexa_token.json` | cached Amazon access token (mode 0600, valid for up to one hour) |
 
 ---
 
@@ -718,7 +763,7 @@ The cron job calls the script every minute; the script checks the interval itsel
 | Served certificates | `openssl s_client` with SNI and `-verify_hostname` |
 | DynDNS | public IPv4 via `api.ipify.org` / `ipv4.icanhazip.com`, DNS via DNS-over-HTTPS (`cloudflare-dns.com`, `dns.google`), `ip -6 addr` |
 | Reachability from the internet | UptimeRobot API v3 (`https://api.uptimerobot.com/v3/monitors`) via `curl`; local diagnosis with `curl --resolve` |
-| Delivery | `/usr/local/emhttp/webGui/scripts/notify`, `curl` for webhook and heartbeat |
+| Delivery | `/usr/local/emhttp/webGui/scripts/notify`, `curl` for webhook, heartbeat and Alexa notifications (Login with Amazon `api.amazon.com`, Proactive Events API `api.eu.amazonalexa.com`) |
 
 All external calls run with `timeout`, so a hanging service does not block the run.
 
@@ -730,6 +775,7 @@ All external calls run with `timeout`, so a hanging service does not block the r
 - **Read-only checks.** Apart from its own paths, srvmon writes nothing to the server; external commands are only called for reading.
 - **Status page behind the login.** The JSON endpoint lives in the plugin directory of the WebGUI and is therefore protected by the WebGUI login. It does not send disk IDs, which usually contain serial numbers, to the browser.
 - **Webhook ID and heartbeat URL are secrets.** They are stored in `srvmon.cfg` on the flash drive, not in the `.plg`. Do not publish the configuration file. In Home Assistant keep `local_only: true` so the webhook can only be triggered from the local network.
+- **Alexa Client Secret.** Together with the Client ID it allows sending notifications to your Echo devices, nothing else (scope `alexa::proactive_events`). It is stored in `srvmon.cfg`, shown as a password field and passed to `curl` via a temporary file with mode 0600. The access token is cached in RAM with mode 0600. If it is leaked, create a new secret in the Developer Console.
 - **UptimeRobot API key.** The main key gives full access to the UptimeRobot account (monitors, alert contacts). It is stored in `srvmon.cfg` on the flash drive like the webhook ID; the settings page shows it as a password field and the status page never receives it. srvmon passes it to `curl` via a temporary file with mode 0600, not on the command line, so it does not appear in the process list. If the key is leaked, delete it in UptimeRobot and create a new one.
 - **Data leaving the server.** Webhook calls contain the notification texts; the heartbeat only consists of the call itself. With external checks enabled, srvmon sends the configured URLs to UptimeRobot and reads the status of all monitors of the account. With the DynDNS check, the IP lookup services see the public IP of the connection (inherent to the request) and Cloudflare/Google see the checked hostnames.
 - **Root privileges.** Plugins run as root. Only install from sources you control. Anyone with write access to the repository behind `pluginURL` can run arbitrary code on the server through an update. Protect the GitHub account with two-factor authentication.
@@ -774,11 +820,13 @@ srvmon was developed and tested with simulated Unraid files and tools and has si
 - format of the OS update check result `/tmp/unraidcheck/result.json` (fields `isNewer`, `version`, `isEligible`, `params.update_exp`) and the downloaded `.plg` files in `/tmp/plugins/` (checked on 7.2.4)
 - update via the *Plugins* tab replaces the program files (since 2026.10.18m)
 - reading the JSON output of `docker inspect`: image IDs and Docker networks per container (since 2026.10.18q)
+- DynDNS check: public IP via ipify and DNS-over-HTTPS detect an outdated DynDNS entry (since 2026.10.19)
 
 **Not yet confirmed:**
 
 | Assumption | How to check |
 |---|---|
+| Alexa notifications via the Proactive Events API (tested against a replica built from the working Alexa-Notify-Bridge, not against Amazon); wording of the German template | set up the skill, run `check.php --test`, ask "Alexa, was sind meine Benachrichtigungen?" |
 | UptimeRobot API v3 as described in its OpenAPI specification (tested against a replica, not against the real service): monitor list, creating keyword monitors with `tagNames`, deleting | enable the external check, run `check.php --force --dry-run`, then wait for "External check created" |
 | Immich answers `/api/server/ping` with `pong` (path of current versions) | open `https://<immich host>/api/server/ping` in the browser |
 | cron entry is present after a reboot without manual action | after a reboot: `date -d @$(cat /tmp/srvmon/lastrun)` |
@@ -808,6 +856,10 @@ srvmon was developed and tested with simulated Unraid files and tools and has si
 ---
 
 ## Changelog
+
+### 2026.10.19a
+- Alexa notifications: the Echo ring lights up yellow until you ask "Alexa, what are my notifications?" (own private skill, official Proactive Events API, called directly by srvmon); setup guide and skill manifest `alexa/skill.json`
+- New options `ALEXA_CLIENT_ID`, `ALEXA_CLIENT_SECRET`, `ALEXA_REGION`, `ALEXA_LEVEL` and `ALEXA_LANG`
 
 ### 2026.10.19
 - DynDNS check: compares the public DNS entries of the configured hostnames with the current public IPv4 address (and AAAA entries with the server's IPv6 addresses); reported after 3 mismatches in a row
