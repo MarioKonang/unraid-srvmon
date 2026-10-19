@@ -2,7 +2,7 @@
 
 srvmon monitors the health of an Unraid server and reports relevant events through Unraid's own notification system (email, push services) and optionally via webhook, for example to Home Assistant for Alexa announcements. It also provides a live status page in the WebGUI.
 
-Version: 2026.10.19b
+Version: 2026.10.19c
 Repository: https://github.com/MarioKonang/unraid-srvmon
 Target platform: Unraid 6.12 and newer (used on 7.2.4, see [Verification status](#verification-status))
 
@@ -407,7 +407,7 @@ Instead of (or in addition to) a voice announcement via the webhook, srvmon can 
 
 A useful combination: `WEBHOOK_LEVEL="alert"` (only alerts are announced immediately) and `ALEXA_LEVEL="warning"` (warnings and alerts additionally light the ring).
 
-**What Alexa says:** Amazon does not allow free text for notifications, only fixed templates. srvmon uses the message template, so Alexa says roughly: *"From Server Monitor: you have a new message from **Server Tower: Disk disk1: temperature critical**"*. The summary of the notification (in `ALEXA_LANG`) is used; long descriptions do not fit. Maximum 256 characters.
+**What Alexa says:** Amazon does not allow free text for notifications, only fixed templates. srvmon uses the message template; the summary of the notification (in `ALEXA_LANG`) is inserted. With German, Alexa says for example: *"Neue Nachricht von Server Tower: Testbenachrichtigung"* (confirmed on an Echo with `ALEXA_LANG="de"`). Long descriptions do not fit; maximum 256 characters.
 
 **How it works:** srvmon uses Amazon's official Proactive Events API through a private skill of your own. The skill stays in development mode; it is not published and not reviewed by Amazon. srvmon calls Amazon directly; no Home Assistant and no additional container is needed. The approach and the skill manifest follow the project [Alexa-Notify-Bridge](https://github.com/R91g/Alexa-Notify-Bridge) (MIT license).
 
@@ -438,7 +438,13 @@ A useful combination: `WEBHOOK_LEVEL="alert"` (only alerts are announced immedia
    ```
    The output says "Alexa notification sent" or the error returned by Amazon. The Echo ring should light up yellow.
 
-If no ring appears although the test reports success: check in the Alexa app under *More > Settings > Notifications* that notifications of *Server Monitor* are allowed, and that the Echo is not in *Do not disturb* mode.
+"Alexa notification sent" means that Amazon accepted the notification (HTTP 202), not that it reached a device. If nothing arrives:
+
+- **Ask anyway:** *"Alexa, was sind meine Benachrichtigungen?"* / *"Alexa, what are my notifications?"*. Notifications can arrive without the ring lighting up.
+- **Skill enabled?** Without step 4 (skill enabled and notifications allowed), Amazon drops the notification silently.
+- **Notifications allowed?** Alexa app: *More > Settings > Notifications*, *Server Monitor* switched on.
+- **Do not disturb:** while it is active (also by schedule), notifications arrive silently, without ring and chime.
+- **Devices with a screen** (Echo Show) show a banner instead of the ring.
 
 ### Heartbeat (outage of the whole server)
 
@@ -822,13 +828,14 @@ srvmon was developed and tested with simulated Unraid files and tools and has si
 - update via the *Plugins* tab replaces the program files (since 2026.10.18m)
 - reading the JSON output of `docker inspect`: image IDs and Docker networks per container (since 2026.10.18q)
 - DynDNS check: public IP via ipify and DNS-over-HTTPS detect an outdated DynDNS entry and a wrong AAAA entry; "Resolved" after the correction (since 2026.10.19)
+- Alexa notifications: skill manifest upload with ASK CLI in a temporary container, token and Proactive Events API accepted by Amazon, notification read out on request (German: "Neue Nachricht von Server Tower: …") (since 2026.10.19a)
 - external check with the real UptimeRobot API v3: creating keyword monitors with tag, reading the status, `DOWN` with local diagnosis via Nginx Proxy Manager, "Resolved" after recovery (since 2026.10.18o)
 
 **Not yet confirmed:**
 
 | Assumption | How to check |
 |---|---|
-| Alexa notifications via the Proactive Events API (tested against a replica built from the working Alexa-Notify-Bridge, not against Amazon); wording of the German template | set up the skill, run `check.php --test`, ask "Alexa, was sind meine Benachrichtigungen?" |
+| yellow ring and chime on the Echo for srvmon notifications: in the first test the notification arrived, but without ring (cause unclear: do not disturb, device type or app setting) | run `check.php --test` during the day without do not disturb and watch the Echo |
 | Immich answers `/api/server/ping` with `pong` (path of current versions) | open `https://<immich host>/api/server/ping` in the browser |
 | cron entry is present after a reboot without manual action | after a reboot: `date -d @$(cat /tmp/srvmon/lastrun)` |
 | format of the Docker update file (fields `local` and `remote`) | `head -c 500 /var/lib/docker/unraid-update-status.json` |
@@ -857,6 +864,9 @@ srvmon was developed and tested with simulated Unraid files and tools and has si
 ---
 
 ## Changelog
+
+### 2026.10.19c
+- README: Alexa notifications confirmed on the server (German wording), troubleshooting extended (notification accepted but not visible, do not disturb, Echo Show)
 
 ### 2026.10.19b
 - Settings and status page show the current description of ongoing problems (from the last run, kept in RAM) instead of the text of the first notification; e.g. an outdated DNS address or an old local check result is no longer shown
