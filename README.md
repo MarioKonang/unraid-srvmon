@@ -2,7 +2,7 @@
 
 srvmon monitors the health of an Unraid server and reports relevant events through Unraid's own notification system (email, push services) and optionally via webhook, for example to Home Assistant for Alexa announcements. It also provides a live status page in the WebGUI.
 
-Version: 2026.10.19a
+Version: 2026.10.19b
 Repository: https://github.com/MarioKonang/unraid-srvmon
 Target platform: Unraid 6.12 and newer (used on 7.2.4, see [Verification status](#verification-status))
 
@@ -279,6 +279,7 @@ There are two kinds of notifications.
 - If a check cannot deliver data, e.g. because the Docker service is off, existing conditions remain unchanged. There is no "Resolved" notification and no reminder in that case.
 - At most 10 notifications are sent per run. If there are more, a summary "Further notifications suppressed" follows.
 - Every notification is also written to the syslog with the tag `srvmon`.
+- The settings page and the status page show the description of the **last run**, e.g. the current local check result of an ongoing outage. The stored state keeps the text as it was notified, so the flash drive is not written on every run.
 - Whether a notification is delivered by email is decided by Unraid based on the agent settings per level (see [Installation](#installation)).
 
 The subject has the form `srvmon: <summary>`; the sender is shown in Unraid as "Server Monitor".
@@ -820,14 +821,14 @@ srvmon was developed and tested with simulated Unraid files and tools and has si
 - format of the OS update check result `/tmp/unraidcheck/result.json` (fields `isNewer`, `version`, `isEligible`, `params.update_exp`) and the downloaded `.plg` files in `/tmp/plugins/` (checked on 7.2.4)
 - update via the *Plugins* tab replaces the program files (since 2026.10.18m)
 - reading the JSON output of `docker inspect`: image IDs and Docker networks per container (since 2026.10.18q)
-- DynDNS check: public IP via ipify and DNS-over-HTTPS detect an outdated DynDNS entry (since 2026.10.19)
+- DynDNS check: public IP via ipify and DNS-over-HTTPS detect an outdated DynDNS entry and a wrong AAAA entry; "Resolved" after the correction (since 2026.10.19)
+- external check with the real UptimeRobot API v3: creating keyword monitors with tag, reading the status, `DOWN` with local diagnosis via Nginx Proxy Manager, "Resolved" after recovery (since 2026.10.18o)
 
 **Not yet confirmed:**
 
 | Assumption | How to check |
 |---|---|
 | Alexa notifications via the Proactive Events API (tested against a replica built from the working Alexa-Notify-Bridge, not against Amazon); wording of the German template | set up the skill, run `check.php --test`, ask "Alexa, was sind meine Benachrichtigungen?" |
-| UptimeRobot API v3 as described in its OpenAPI specification (tested against a replica, not against the real service): monitor list, creating keyword monitors with `tagNames`, deleting | enable the external check, run `check.php --force --dry-run`, then wait for "External check created" |
 | Immich answers `/api/server/ping` with `pong` (path of current versions) | open `https://<immich host>/api/server/ping` in the browser |
 | cron entry is present after a reboot without manual action | after a reboot: `date -d @$(cat /tmp/srvmon/lastrun)` |
 | format of the Docker update file (fields `local` and `remote`) | `head -c 500 /var/lib/docker/unraid-update-status.json` |
@@ -856,6 +857,10 @@ srvmon was developed and tested with simulated Unraid files and tools and has si
 ---
 
 ## Changelog
+
+### 2026.10.19b
+- Settings and status page show the current description of ongoing problems (from the last run, kept in RAM) instead of the text of the first notification; e.g. an outdated DNS address or an old local check result is no longer shown
+- README: external check (UptimeRobot) and DynDNS check confirmed on the server
 
 ### 2026.10.19a
 - Alexa notifications: the Echo ring lights up yellow until you ask "Alexa, what are my notifications?" (own private skill, official Proactive Events API, called directly by srvmon); setup guide and skill manifest `alexa/skill.json`

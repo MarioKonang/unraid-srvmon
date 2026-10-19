@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "srvmon">
 <!ENTITY author    "MarioKonang">
-<!ENTITY version   "2026.10.19a">
+<!ENTITY version   "2026.10.19b">
 <!ENTITY repo      "https://github.com/MarioKonang/unraid-srvmon">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/MarioKonang/unraid-srvmon/main/srvmon.plg">
 <!ENTITY emhttp    "/usr/local/emhttp/plugins/&name;">
@@ -11,6 +11,9 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" pluginURL="&pluginURL;" min="6.12.0" icon="heartbeat" launch="Settings/srvmon" support="&repo;">
 
 <CHANGES>
+###2026.10.19b
+- Settings and status page show the current description of ongoing problems instead of the text of the first notification
+
 ###2026.10.19a
 - Alexa notifications (yellow ring) via an own private skill and Amazon's Proactive Events API
 - New options ALEXA_CLIENT_ID, ALEXA_CLIENT_SECRET, ALEXA_REGION, ALEXA_LEVEL and ALEXA_LANG
@@ -1403,8 +1406,9 @@ $cfg    = sm_load_cfg();
 $state  = sm_load_state();
 $status = json_decode((string)@file_get_contents(SM_TMP . '/status.json'), true) ?: [];
 
+// current descriptions from the last run (RAM); after a reboot, before the first run: the stored state
 $issues = [];
-foreach ($state['issues'] ?? [] as $k => $i) {
+foreach (isset($status['issues']) && is_array($status['issues']) ? $status['issues'] : ($state['issues'] ?? []) as $k => $i) {
     $issues[] = ['key' => (string)$k, 'level' => $i['level'] ?? 'warning', 'subject' => $i['subject'] ?? '',
                  'desc' => $i['desc'] ?? '', 'since' => (int)($i['since'] ?? 0)];
 }
@@ -1564,7 +1568,8 @@ if (sm_on($cfg, 'CHECK_DYNDNS'))   sm_check_dyndns($cfg, $state, $issues, $ran);
 $now    = time();
 $remind = (int)sm_num($cfg, 'REMIND_HOURS', 24) * 3600;
 $prev   = $state['issues'] ?? [];
-$next   = [];
+$next   = [];   // persisted (flash): description as notified
+$live   = [];   // RAM only (status.json): current description for the WebGUI
 $queue  = [];
 
 foreach ($issues as $key => [$lvl, $subj, $desc]) {
@@ -1579,14 +1584,15 @@ foreach ($issues as $key => [$lvl, $subj, $desc]) {
         $next[$key] = ['level' => $lvl, 'subject' => $subj, 'desc' => $desc,
                        'since' => $p['since'], 'notified' => $now];
     } else {
-        // do not update the description, otherwise the flash drive would be written on every run
+        // do not update the description in the state, otherwise the flash drive would be written on every run
         $p['level'] = $lvl;
         $next[$key] = $p;
     }
+    $live[$key] = ['subject' => $subj, 'desc' => $desc] + $next[$key];
 }
 foreach ($prev as $key => $p) {
     if (isset($next[$key])) continue;
-    if (!sm_prefix_ran((string)$key, $ran)) { $next[$key] = $p; continue; }   // check did not run: decide nothing
+    if (!sm_prefix_ran((string)$key, $ran)) { $next[$key] = $live[$key] = $p; continue; }   // check did not run: decide nothing
     if (sm_on($cfg, 'NOTIFY_RESOLVED')) {
         $queue[] = ['normal', 'Resolved: ' . $p['subject'], 'The condition is back to normal.'];
     }
@@ -1613,7 +1619,7 @@ if (!$dry) {
     if ($hb !== '') exec('curl -fsS -m 10 --retry 2 -o /dev/null ' . escapeshellarg($hb) . ' >/dev/null 2>&1 &');
     sm_save_state($state);
     @file_put_contents(SM_TMP . '/status.json', json_encode(
-        ['lastrun' => $now, 'issues' => $next], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+        ['lastrun' => $now, 'issues' => $live], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
 }
 exit(0);
 
